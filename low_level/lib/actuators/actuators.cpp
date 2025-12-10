@@ -4,251 +4,286 @@
  *                                          Drive function
    =========================================================================================================*/
 
-// ======================= Private function declarations =======================
+// ======================= Private function definitions =======================
 
-// Change direction of motor
+// Change direction of motor according to state "direction"
 void Actuators::Drive::change_direction()
 {
-    switch(this->direction)
+    switch (this->direction)
     {
         // IDLE
         case 0:
-            digitalWrite(MOTOR_OUT_1_PIN,false);
-            digitalWrite(MOTOR_OUT_2_PIN,false);
+            digitalWrite(MOTOR_OUT_1_PIN, false);
+            digitalWrite(MOTOR_OUT_2_PIN, false);
             encoder_calculation_flag = false;
-        break;
+            break;
 
         // Run forward
         case 1:
-            digitalWrite(MOTOR_OUT_1_PIN,true);
-            digitalWrite(MOTOR_OUT_2_PIN,false);
-        break;
-        
+            digitalWrite(MOTOR_OUT_1_PIN, true);
+            digitalWrite(MOTOR_OUT_2_PIN, false);
+            break;
+
         // Run backward
         case 2:
-            digitalWrite(MOTOR_OUT_1_PIN,false);
-            digitalWrite(MOTOR_OUT_2_PIN,true);
-        break;
+            digitalWrite(MOTOR_OUT_1_PIN, false);
+            digitalWrite(MOTOR_OUT_2_PIN, true);
+            break;
+
+        default:
+            digitalWrite(MOTOR_OUT_1_PIN, false);
+            digitalWrite(MOTOR_OUT_2_PIN, false);
+            encoder_calculation_flag = false;
+            direction = 0;
+            break;
     }
 }
 
-void Actuators::Drive::update_direction(bool direction)
+void Actuators::Drive::update_direction(bool dir_fwd)
 {
-    int8_t direction_flag = this->direction;
-    if (direction_flag == 0)
-        {
-            if (direction == true)
-            {
-                this->direction = 1;
-                change_direction();
-            }
-            else
-            {
-                this->direction = -1;
-                change_direction();
-            }
-        } 
-        else if (direction_flag > 0 and direction == false)
-        {   
-            this->direction = -1;
-            change_direction();
-        }
-        else if (direction_flag < 0 and direction == true)
-        {
-            this->direction = 1;
-            change_direction();
-        }
+    if (dir_fwd)
+    {
+        this->direction = 1; // forward
+    }
+    else
+    {
+        this->direction = 2; // backward
+    }
+    change_direction();
 }
 
+// ======================= Get function definitions =======================
 
-// ======================= Get function declarations =======================
-
-// Get current control direction 
 int8_t Actuators::Drive::get_directionStatus()
 {
     return this->direction;
 }
 
-// Get respond speed
 int16_t Actuators::Drive::get_respondedSpeed()
 {
-    return this->responded_speed;
+    // cast float to int16 for external use
+    if (responded_speed < 0.0f) return 0;
+    if (responded_speed > 32767.0f) return 32767;
+    return static_cast<int16_t>(responded_speed);
 }
 
-// If the motor is rotation
+// Check motor rotation state based on encoder pulses
 bool Actuators::Drive::isRotating(unsigned long tmr)
 {
-    if (!rotate_flag) // The encoder pulse has not been kicked yet 
+    // If no pulse has been received yet, consider not rotating after wait time
+    if (!rotate_flag)
     {
-        if ((tmr-timer) > WAIT_RESPONSE_TIME)
+        if ((tmr - timer) > WAIT_RESPONSE_TIME)
         {
             return false;
-        } 
+        }
         else
         {
             return true;
         }
     }
-    else // Receive signal from encoder
+    else
     {
-        // Update time
-        this->rotate_flag = false;
+        // At least one pulse received; check time since last pulse
+        if ((tmr - timer) > WAIT_RESPONSE_TIME)
+        {
+            return false;
+        }
         return true;
     }
 }
 
-// ======================= Public function declarations =======================
+// ======================= Public function definitions =======================
 
-// Declare pin function
-Actuators::Drive::Drive(uint8_t MOTOR_OUT_1_PIN,uint8_t MOTOR_OUT_2_PIN,uint8_t MOTOR_PWM_PIN,
-                        uint8_t ENCODER_CHANNEL_1,uint8_t ENCODER_CHANNEL_2,size_t RESOLUTION,
+Actuators::Drive::Drive(uint8_t MOTOR_OUT_1_PIN,
+                        uint8_t MOTOR_OUT_2_PIN,
+                        uint8_t MOTOR_PWM_PIN,
+                        uint8_t ENCODER_CHANNEL_1,
+                        uint8_t ENCODER_CHANNEL_2,
+                        size_t  RESOLUTION,
                         unsigned long wait_time)
 {
-    this->MOTOR_OUT_1_PIN   = MOTOR_OUT_1_PIN;
-    this->MOTOR_OUT_2_PIN   = MOTOR_OUT_2_PIN;
-    this->MOTOR_PWM_PIN     = MOTOR_PWM_PIN;
-    this->ENCODER_CHANNEL_A = ENCODER_CHANNEL_1;
-    this->ENCODER_CHANNEL_B = ENCODER_CHANNEL_2;
+    this->MOTOR_OUT_1_PIN    = MOTOR_OUT_1_PIN;
+    this->MOTOR_OUT_2_PIN    = MOTOR_OUT_2_PIN;
+    this->MOTOR_PWM_PIN      = MOTOR_PWM_PIN;
+    this->ENCODER_CHANNEL_A  = ENCODER_CHANNEL_1;
+    this->ENCODER_CHANNEL_B  = ENCODER_CHANNEL_2;
     this->ENCODER_RESOLUTION = RESOLUTION;
     this->WAIT_RESPONSE_TIME = wait_time;
-    
-    pinMode(MOTOR_OUT_1_PIN,OUTPUT);
-    pinMode(MOTOR_OUT_2_PIN,OUTPUT);
-    pinMode(MOTOR_PWM_PIN,OUTPUT);
-    pinMode(ENCODER_CHANNEL_1,INPUT);
-    pinMode(ENCODER_CHANNEL_2,INPUT);
+
+    pinMode(this->MOTOR_OUT_1_PIN, OUTPUT);
+    pinMode(this->MOTOR_OUT_2_PIN, OUTPUT);
+    pinMode(this->MOTOR_PWM_PIN,   OUTPUT);
+    pinMode(this->ENCODER_CHANNEL_A, INPUT);
+    pinMode(this->ENCODER_CHANNEL_B, INPUT);
+
+    digitalWrite(this->MOTOR_OUT_1_PIN, LOW);
+    digitalWrite(this->MOTOR_OUT_2_PIN, LOW);
+    analogWrite(this->MOTOR_PWM_PIN, 0);
+
+    direction                = 0;
+    encoder_count            = 0;
+    encoder_calculation_flag = false;
+    responded_speed          = 0.0f;
+    timer                    = millis();
+    rotate_flag              = false;
 }
 
-// Turn drive able to run
+// Enable drive
 void Actuators::Drive::enable()
 {
     this->available = true;
 }
 
-// Disable drive to run
+// Disable drive
 void Actuators::Drive::disable()
 {
     available = false;
-
-    // Disable output pin
+    direction = 0;
     change_direction();
+    analogWrite(MOTOR_PWM_PIN, 0);
 }
 
-// Brake 
+// Brake
 void Actuators::Drive::brake()
 {
-    digitalWrite(MOTOR_OUT_1_PIN,true);
-    digitalWrite(MOTOR_OUT_2_PIN,true);
-    analogWrite(MOTOR_PWM_PIN,0);
-    delay(100);
+    // Simple electrical brake
+    digitalWrite(MOTOR_OUT_1_PIN, true);
+    digitalWrite(MOTOR_OUT_2_PIN, true);
+    analogWrite(MOTOR_PWM_PIN, 0);
+    delay(50);
+    direction = 0;
     change_direction();
 }
 
 // Start to control speed
-bool Actuators::Drive::driving(uint8_t speed,bool direction)
+bool Actuators::Drive::driving(uint8_t speed, bool direction_fwd)
 {
     if (!available)
     {
         return false;
-    }    
-    else
+    }
+
+    // If speed = 0 -> stop
+    if (speed == 0)
     {
-        analogWrite(MOTOR_PWM_PIN, speed);  
-        update_direction(direction);      
+        direction = 0;
+        change_direction();
+        analogWrite(MOTOR_PWM_PIN, 0);
         return true;
     }
+
+    analogWrite(MOTOR_PWM_PIN, speed);
+    update_direction(direction_fwd);
+    return true;
 }
 
 // Interrupt function for calculation of Encoder's channel A
 void Actuators::Drive::Endcoder_channel_A_ISR()
 {
-    if (digitalRead(ENCODER_CHANNEL_A) == digitalRead(ENCODER_CHANNEL_B)) {
+    if (digitalRead(ENCODER_CHANNEL_A) == digitalRead(ENCODER_CHANNEL_B))
+    {
         encoder_count++; // Increase encoder pulse accumulate
-    } else {
+    }
+    else
+    {
         encoder_count--; // Decrease encoder pulse accumulate
     }
 
-    // Calculate speed
-    long tmr = millis(); // Take instance time
-    if (encoder_calculation_flag) { // Check wheter this is the first pulse after robot stop 
-    long dt = tmr - timer;
-    if (dt > 0) {
-      responded_speed = (float)ENCODER_RESOLUTION * 1000.0f / (float)dt;
+    unsigned long tmr = millis(); // Take instance time
+
+    if (encoder_calculation_flag)
+    {
+        unsigned long dt = tmr - timer;
+        if (dt > 0)
+        {
+            // Pulses per second = ENCODER_RESOLUTION * 1000 / dt
+            responded_speed = (float)ENCODER_RESOLUTION * 1000.0f / (float)dt;
+        }
     }
-    } else {
+    else
+    {
         encoder_calculation_flag = true;
     }
 
-    timer = tmr;
+    timer       = tmr;
+    rotate_flag = true;
 }
 
 // Interrupt function for calculation of Encoder's channel B
 void Actuators::Drive::Endcoder_channel_B_ISR()
 {
-    if (digitalRead(ENCODER_CHANNEL_A) != digitalRead(ENCODER_CHANNEL_B)) {
+    if (digitalRead(ENCODER_CHANNEL_A) != digitalRead(ENCODER_CHANNEL_B))
+    {
         encoder_count++; // Increase encoder pulse accumulate
-    } else {
+    }
+    else
+    {
         encoder_count--; // Decrease encoder pulse accumulate
     }
 
-    // Calculate speed
-    long tmr = millis(); // Take instance time
-    if (encoder_calculation_flag) // Check wheter this is the first pulse after robot stop
-    {  
-        long dt = tmr - timer;
-        if (dt > 0) {
+    unsigned long tmr = millis(); // Take instance time
+
+    if (encoder_calculation_flag)
+    {
+        unsigned long dt = tmr - timer;
+        if (dt > 0)
+        {
             responded_speed = (float)ENCODER_RESOLUTION * 1000.0f / (float)dt;
         }
-        } else {
-            encoder_calculation_flag = true;
-        }
+    }
+    else
+    {
+        encoder_calculation_flag = true;
+    }
 
-    timer = tmr;
+    timer       = tmr;
+    rotate_flag = true;
 }
-
-
 
 /** =========================================================================================================
  *                                          Steer function
    =========================================================================================================*/
 
-// =======================  =======================
-
-// Init object
 Actuators::Steer::Steer(uint8_t STEERING_PIN)
 {
     this->STEERING_PIN = STEERING_PIN;
-    servo.attach(STEERING_PIN);
+    servo.attach(this->STEERING_PIN);
 }
 
-int Actuators::Steer::saturation(int pulse)
+int Actuators::Steer::saturation(int angle_deg)
 {
-    if (pulse < low_limit)
+    if (angle_deg < low_limit)
     {
         return low_limit;
     }
-    else if (pulse > high_limit)
+    else if (angle_deg > high_limit)
     {
         return high_limit;
     }
-    return pulse;
-
+    return angle_deg;
 }
 
-// Turns
-void Actuators::Steer::turn(int pulse)
+// Turn servo by angle in degrees
+void Actuators::Steer::turn(int angle_deg)
 {
-    servo.writeMicroseconds(saturation(pulse));
+    servo.write(saturation(angle_deg));
 }
 
 // Enable
 void Actuators::Steer::enable()
 {
-    servo.attach(STEERING_PIN);
+    if (!servo.attached())
+    {
+        servo.attach(STEERING_PIN);
+    }
 }
 
 // Disable
 void Actuators::Steer::disable()
 {
-    servo.detach();
+    if (servo.attached())
+    {
+        servo.detach();
+    }
 }

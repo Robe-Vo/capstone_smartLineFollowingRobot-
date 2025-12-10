@@ -1,10 +1,7 @@
 /**
- *                                                  ================= Note =================
- * 
- *      This is the library for line following robot using two differetial drives and ackerman mechanism for driving direction   
+ *  This is the library for line following robot using two differential drives
+ *  and Ackermann mechanism for driving direction.
  */
-
-
 
 #pragma once
 
@@ -13,84 +10,91 @@
 
 class Actuators
 {
+public:
+    // ========= Driving motor =========
+    class Drive
+    {
+    private:
+        // Pin declaration
+        uint8_t MOTOR_OUT_1_PIN;
+        uint8_t MOTOR_OUT_2_PIN;
+        uint8_t MOTOR_PWM_PIN;
+        uint8_t ENCODER_CHANNEL_A;
+        uint8_t ENCODER_CHANNEL_B;
+
+        size_t        ENCODER_RESOLUTION;
+        unsigned long WAIT_RESPONSE_TIME;
+
+        // Flags
+        bool   available  = false;  // drive enable flag
+        bool   rotate_flag = false; // set true when encoder tick arrives
+        int8_t direction  = 0;      // 0: idle, 1: fwd, 2: rev
+
+        // Feedback
+        bool          encoder_calculation_flag = false; // true after first pulse
+        float         responded_speed = 0.0f;
+        unsigned long encoder_count   = 0;
+        unsigned long timer           = 0;  // last encoder pulse time [ms]
+
+        // Change direction according to "direction" state
+        void change_direction();
+
+        // Update direction based on input boolean (true = forward, false = backward)
+        void update_direction(bool dir_fwd);
+
     public:
-        // ========= Driving motor =========
-        class Drive
-        {
-            private:
-                // Pin declaration
-                uint8_t MOTOR_OUT_1_PIN;
-                uint8_t MOTOR_OUT_2_PIN;
-                uint8_t MOTOR_PWM_PIN;
-                uint8_t ENCODER_CHANNEL_A;
-                uint8_t ENCODER_CHANNEL_B;
+        Drive(uint8_t MOTOR_OUT_1_PIN,
+              uint8_t MOTOR_OUT_2_PIN,
+              uint8_t MOTOR_PWM_PIN,
+              uint8_t ENCODER_CHANNEL_1,
+              uint8_t ENCODER_CHANNEL_2,
+              size_t  RESOLUTION,
+              unsigned long wait_time);
 
-                size_t ENCODER_RESOLUTION;
-                unsigned long WAIT_RESPONSE_TIME;
+        // Get
+        int8_t  get_directionStatus();
+        int16_t get_respondedSpeed();
+        bool    isRotating(unsigned long tmr);
 
-                // Flag bit
-                bool available = false;     // Flag bit to turn off motor
-                bool rotate_flag = true;
-                int8_t direction = 0;
+        // Update action state of motor
+        void enable();
+        void disable();
+        void brake();
 
-                // Feeback signal
-                bool encoder_calculation_flag = false; // Flag bit for caluclation -> prevent first data deviation
-                float responded_speed = 0;
-                unsigned long encoder_count = 0;
-                unsigned long timer = 0;
+        // Motor action
+        bool driving(uint8_t speed, bool direction_fwd);
 
-                // Change direction
-                void change_direction();
-                // Update direction
-                void update_direction(bool);
-            
-            public:
-                Drive(uint8_t MOTOR_OUT_1_PIN,uint8_t MOTOR_OUT_2_PIN,uint8_t MOTOR_PWM_PIN,
-                      uint8_t ENCODER_CHANNEL_1,uint8_t ENCODER_CHANNEL_2,size_t RESOLUTION,
-                      unsigned long wait_time);
+        // Motor respond | Encoder
+        void Endcoder_channel_A_ISR();
+        void Endcoder_channel_B_ISR();
+    };
 
-                // Get 
-                int8_t get_directionStatus();
-                int16_t get_respondedSpeed();
-                bool isRotating(unsigned long tmr);
+    // ========= Steering motor =========
+    class Steer
+    {
+    private:
+        // Output pin
+        uint8_t STEERING_PIN;
 
+        // Angle range [deg]
+        uint16_t offset_angle = 0;
+        int      low_limit    = 55;   // min steering angle [deg]
+        int      high_limit   = 110;  // max steering angle [deg]
 
-                // Update action state of motor
-                void enable();
-                void disable();
-                void brake();
+        Servo servo;
 
-                // Motor action
-                bool driving(uint8_t,bool);
-                
-                // Motor respond | Encoder
-                void Endcoder_channel_A_ISR();
-                void Endcoder_channel_B_ISR();
-        };
+        int saturation(int angle_deg);
 
-        // ========= Steering motor =========
-        class Steer
-        {
-            private:
-                // Declare output pin 
-                uint8_t STEERING_PIN;
-                
-                // Angle range
-                uint16_t offset_angle = 0;   
-                int low_limit = 60;
-                int high_limit = 120;
+    public:
+        Steer(uint8_t STEERING_PIN);
 
-                Servo servo;
+        // Set angle in degrees (0..180)
+        void turn(int angle_deg);
 
-                int saturation(int);
-            public:
-                Steer(uint8_t STEERING_PIN);
+        // Disable servo
+        void disable();
 
-                // Set angle
-                void turn(int pulse);    // Send pulse signal (angle = 0 || angle > 500)
-                // Disable servo
-                void disable();
-                // Enable servo
-                void enable();
-        };
+        // Enable servo
+        void enable();
+    };
 };

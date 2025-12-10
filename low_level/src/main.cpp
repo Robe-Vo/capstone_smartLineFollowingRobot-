@@ -3,38 +3,42 @@
 
 #include "bluetooth.hpp"
 #include "sensors.hpp"
+#include "actuators.hpp"
 
 /* ======================= CONFIG ======================= */
 
-#define TIME_SEND_SIGNAL     50   // ms between frames
-#define TIME_KICK_ULTRA      60   // ms
+#define TIME_SEND_SIGNAL       50   // ms between frames
+#define TIME_KICK_ULTRA        60   // ms
 
-#define LINE_SENSOR_IDX_5_PIN 32
-#define LINE_SENSOR_IDX_4_PIN 35
-#define LINE_SENSOR_IDX_3_PIN 34
-#define LINE_SENSOR_IDX_2_PIN 39
-#define LINE_SENSOR_IDX_1_PIN 36
+#define LINE_SENSOR_IDX_5_PIN  32
+#define LINE_SENSOR_IDX_4_PIN  35
+#define LINE_SENSOR_IDX_3_PIN  34
+#define LINE_SENSOR_IDX_2_PIN  39
+#define LINE_SENSOR_IDX_1_PIN  36
 
-#define ULTRASONIC_TRIG_PIN 26
-#define ULTRASONIC_ECHO_PIN 27
+#define ULTRASONIC_TRIG_PIN    26
+#define ULTRASONIC_ECHO_PIN    27
 
-#define MOTOR_PWM_PIN   5
-#define MOTOR_OUT_1_PIN 18
-#define MOTOR_OUT_2_PIN 19
+#define MOTOR_PWM_PIN          5
+#define MOTOR_OUT_1_PIN        18
+#define MOTOR_OUT_2_PIN        19
 
-// SIMPLE ENCODER: use only channel A for speed
-#define ENCODER_CHANNEL_1_PIN  33
-#define ENCODER_CHANNEL_1_PIN  25
-#define ENCODER_PPR     44  // pulses per revolution
+// Encoder channels
+#define ENCODER_CHANNEL_A_PIN  33   // Channel A
+#define ENCODER_CHANNEL_B_PIN  25   // Channel B
+#define ENCODER_PPR            44   // pulses per revolution (per channel A edge)
+#define ENCODER_WAIT_RESPONSE_TIME 200  // ms
 
-#define SERVO_PIN 23
+#define SERVO_PIN              23
+
+#define DEBUG_ENCODER          1    // set 0 to disable Serial debug in ISRs
 
 /* ======================= ENCODER STATE ======================= */
 
-// Total pulses (for debug)
+// Total pulses (for distance, signed)
 static volatile int32_t encoder_pulse_total = 0;
 
-// Pulses accumulated in current frame
+// Pulses accumulated in current frame (for speed)
 static volatile int32_t encoder_pulse_frame = 0;
 
 // Speed in RPM (computed once per frame)
@@ -45,14 +49,24 @@ static volatile float   encoder_speed = 0.0f;
 // line_readSignals() returns pointer to 5 bytes
 uint8_t*  line_signals = nullptr;
 
-// ultrasonic distance (unit depends on your ultra code)
+// ultrasonic distance
 uint16_t ultra_signal = 0;
 
 // MPU processed signals
 uint16_t mpu_signals[6] = {0};
 
 /* ======================= ACTUATORS ======================= */
-Servo servo;
+
+static Actuators::Drive drive(
+    MOTOR_OUT_1_PIN,
+    MOTOR_OUT_2_PIN,
+    MOTOR_PWM_PIN,
+    ENCODER_CHANNEL_A_PIN,
+    ENCODER_CHANNEL_B_PIN,
+    ENCODER_PPR,
+    ENCODER_WAIT_RESPONSE_TIME);
+
+static Actuators::Steer steer(SERVO_PIN);
 
 /* ======================= COMMUNICATION ======================= */
 Network server(5946);
@@ -65,7 +79,7 @@ static uint16_t steer_angle  = 90;
 static volatile bool flag_read_line          = false;
 static volatile bool flag_read_ultra         = false;
 static volatile bool flag_read_mpu           = false;
-static volatile bool flag_run_drive_forward  = false; 
+static volatile bool flag_run_drive_forward  = false;
 static volatile bool flag_run_drive_backward = false;
 static volatile bool flag_run_drive_stop     = false;
 static volatile bool flag_disable_steer      = false;
@@ -73,6 +87,10 @@ static volatile bool flag_turn_steer         = false;
 
 static volatile bool flag_op_transmit_ready  = true;
 static volatile bool flag_op_stop_motor      = false;
+
+// safety enable/disable in IDLE
+static volatile bool flag_drive_enable       = false;
+static volatile bool flag_drive_disable      = false;
 
 static volatile unsigned long tick_1ms       = 0;
 static volatile unsigned long tick_transmit  = 0;
@@ -95,13 +113,14 @@ void IDLE_process(void *parameter);
 void OPERATION_process(void *parameter);
 void com_process(void *parameter);
 
+/* ======================= ENCODER ISR PROTOTYPES ======================= */
+void IRAM_ATTR ISR_encoder_A();
+void IRAM_ATTR ISR_encoder_B();
+
 /* ======================= HELPERS ======================= */
 void driveForward(uint8_t speed);
 void stopMotor();
 void setSteerAngle(uint16_t angle);
-
-/* ======================= ENCODER ISR ======================= */
-void IRAM_ATTR ISR_encoder();
 
 /* ======================= SETUP ======================= */
 
@@ -119,19 +138,27 @@ void setup()
     ultra_setup(ULTRASONIC_TRIG_PIN, ULTRASONIC_ECHO_PIN);
     // mpu_setup(21, 22);   // SDA, SCL – change if needed
 
-    // Echo ISR
+    // Echo ISR for ultrasonic
     attachInterrupt(ULTRASONIC_ECHO_PIN, hanlder_ultra_echo, CHANGE);
 
-    /* -------- Actuators setup -------- */
-    pinMode(MOTOR_OUT_1_PIN, OUTPUT);
-    pinMode(MOTOR_OUT_2_PIN, OUTPUT);
-    pinMode(MOTOR_PWM_PIN,   OUTPUT);
+    /* -------- Encoder setup (A & B) -------- */
+    pinMode(ENCODER_CHANNEL_A_PIN, INPUT_PULLUP);
+    pinMode(ENCODER_CHANNEL_B_PIN, INPUT_PULLUP);
 
-    servo.attach(SERVO_PIN);
-    servo.write(steer_angle);    // center
+    // Channel A: use for speed + direction
+    attachInterrupt(digitalPinToInterrupt(ENCODER_CHANNEL_A_PIN),
+                    ISR_encoder_A,
+                    CHANGE);
 
-    // Make sure motor is stopped at start
-    stopMotor();
+    // Channel B: debug + better quadrature (trigger on any edge)
+    attachInterrupt(digitalPinToInterrupt(ENCODER_CHANNEL_B_PIN),
+                    ISR_encoder_B,
+                    CHANGE);
+
+    /* -------- Steer initial position -------- */
+    steer.enable();
+    steer_angle = 90;
+    steer.turn((int)steer_angle);
 
     /* -------- Network setup -------- */
     Serial.println("Start to configurate network");
@@ -147,10 +174,6 @@ void setup()
     timerAttachInterrupt(Timer0_Cfg, &Timer0_ISR, true);
     timerAlarmWrite(Timer0_Cfg, 1000, true);  // 1 ms period
     timerAlarmEnable(Timer0_Cfg);
-
-    /* -------- Encoder setup (single channel) -------- */
-    pinMode(ENCODER_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), ISR_encoder, RISING);
 
     robot_mode = IDLE_MODE;
 
@@ -201,13 +224,49 @@ void IRAM_ATTR Timer0_ISR()
     tick_1ms++;
 }
 
-/* ======================= ENCODER ISR ======================= */
+/* ======================= ENCODER ISRs ======================= */
 
-void IRAM_ATTR ISR_encoder()
+// Channel A ISR: main pulse counter for speed & distance
+void IRAM_ATTR ISR_encoder_A()
 {
-    // Count rising edges
+    // Signed pulse counting can be extended if you want to use direction
     encoder_pulse_total++;
     encoder_pulse_frame++;
+
+    // Use Drive encoder handler (quadrature + speed estimation)
+    drive.Endcoder_channel_A_ISR();
+
+#if DEBUG_ENCODER
+    static uint32_t lastPrintA = 0;
+    uint32_t now = micros();
+    if (now - lastPrintA > 5000)   // print every ~5 ms max (debug only)
+    {
+        Serial.print("[ENC A] total=");
+        Serial.print(encoder_pulse_total);
+        Serial.print(" frame=");
+        Serial.print(encoder_pulse_frame);
+        Serial.print("  driveSpeed=");
+        Serial.println(drive.get_respondedSpeed());
+        lastPrintA = now;
+    }
+#endif
+}
+
+// Channel B ISR: second channel used for direction + debug
+void IRAM_ATTR ISR_encoder_B()
+{
+    drive.Endcoder_channel_B_ISR();
+
+#if DEBUG_ENCODER
+    static uint32_t lastPrintB = 0;
+    uint32_t now = micros();
+    if (now - lastPrintB > 5000)   // print every ~5 ms max (debug only)
+    {
+        Serial.print("[ENC B] driveSpeed=");
+        Serial.println(drive.get_respondedSpeed());
+        lastPrintB = now;
+    }
+#endif
 }
 
 /* ======================= COMMUNICATION TASK ======================= */
@@ -253,9 +312,20 @@ void com_process(void *parameter)
                             flag_read_mpu = true;
                             break;
 
+                        /* -------- Drive Safety Commands in IDLE -------- */
+                        // [0xE1] : enable drive
+                        case 0xE1:
+                            flag_drive_enable = true;
+                            break;
+
+                        // [0xE2] : disable drive
+                        case 0xE2:
+                            flag_drive_disable = true;
+                            break;
+
                         /* -------- Drive / Servo Commands -------- */
 
-                        // [0xDF] [speed]
+                        // [0xDF] [speed] : forward in IDLE
                         case 0xDF:
                         {
                             uint8_t spd;
@@ -265,7 +335,7 @@ void com_process(void *parameter)
                                 flag_run_drive_forward = true;
                                 Serial.print("Command: ");
                                 Serial.print(c);
-                                Serial.print(" | ");
+                                Serial.print(" | speed=");
                                 Serial.println(speed);
                             }
                             else
@@ -275,7 +345,7 @@ void com_process(void *parameter)
                             break;
                         }
 
-                        // [0xDE] [speed]
+                        // [0xDE] [speed] : backward in IDLE
                         case 0xDE:
                         {
                             uint8_t spd;
@@ -353,27 +423,29 @@ void com_process(void *parameter)
                     encoder_pulse_frame = 0;
                     interrupts();
 
-                    // 2) Compute speed from pulses per TIME_SEND_SIGNAL
+                    // 2) Compute speed from pulses per TIME_SEND_SIGNAL [ms]
                     float pulses_f     = (float)pulses;
                     float pulses_per_s = pulses_f * (1000.0f / (float)TIME_SEND_SIGNAL);
                     float rev_per_s    = pulses_per_s / (float)ENCODER_PPR;
                     float rpm          = rev_per_s * 60.0f;
-                    if (rpm < 0.0f) rpm = 0.0f;  // single channel -> no direction
+
+                    if (rpm < 0.0f) rpm = 0.0f;
 
                     encoder_speed = rpm;
 
-                    // Debug to Serial
-                    Serial.print("[ENC] pulses_frame=");
+#if DEBUG_ENCODER
+                    Serial.print("[ENC FRAME] pulses_frame=");
                     Serial.print(pulses);
                     Serial.print("  rpm=");
                     Serial.println(encoder_speed);
+#endif
 
                     // 3) Build frame (22 bytes):
                     // [0..4]   : 5 bytes line sensors
                     // [5..6]   : 2 bytes ultrasonic (uint16, big-endian)
                     // [7..18]  : reserved (0)
-                    // [19]     : encoder counter (uint8, pulses this frame)
-                    // [20..21] : encoder_speed[rpm]*100 (uint16, big-endian)
+                    // [19]     : encoder pulses this frame (uint8)
+                    // [20..21] : encoder_speed [rpm] (uint16, big-endian)
                     const uint8_t FRAME_LEN = 22;
                     uint8_t frame[FRAME_LEN] = {0};
 
@@ -392,10 +464,11 @@ void com_process(void *parameter)
                     if (pulses > 255) pulses = 255;
                     frame[19] = (uint8_t)pulses;
 
-                    // speed: float rpm -> uint16 (scale 100)
-                    float spd_f = encoder_speed;
-                    if (spd_f < 0.0f)     spd_f = 0.0f;
-                    uint16_t spd_q = (uint16_t)(spd_f);   // store rpm directly
+                    // speed: float rpm -> uint16 (integer rpm)
+                    float    spd_f = encoder_speed;
+                    if (spd_f < 0.0f)    spd_f = 0.0f;
+                    if (spd_f > 65535.0f) spd_f = 65535.0f;
+                    uint16_t spd_q = (uint16_t)(spd_f);
 
                     frame[20] = (uint8_t)(spd_q >> 8);
                     frame[21] = (uint8_t)(spd_q & 0xFF);
@@ -459,6 +532,22 @@ void IDLE_process(void *parameter)
     {
         if (robot_mode == IDLE_MODE)
         {
+            /* ---------- Drive safety enable/disable ---------- */
+
+            if (flag_drive_enable)
+            {
+                flag_drive_enable = false;
+                drive.enable();
+                Serial.println("[DRIVE] enabled");
+            }
+
+            if (flag_drive_disable)
+            {
+                flag_drive_disable = false;
+                drive.disable();
+                Serial.println("[DRIVE] disabled");
+            }
+
             /* ---------- Sensor requests ---------- */
 
             if (flag_read_line)
@@ -502,23 +591,19 @@ void IDLE_process(void *parameter)
             if (flag_run_drive_forward)
             {
                 flag_run_drive_forward = false;
-                digitalWrite(MOTOR_OUT_1_PIN, HIGH);
-                digitalWrite(MOTOR_OUT_2_PIN, LOW);
-                analogWrite(MOTOR_PWM_PIN, speed);
+                drive.driving(speed, true);   // forward
             }
 
             if (flag_run_drive_backward)
             {
                 flag_run_drive_backward = false;
-                digitalWrite(MOTOR_OUT_1_PIN, LOW);
-                digitalWrite(MOTOR_OUT_2_PIN, HIGH);
-                analogWrite(MOTOR_PWM_PIN, speed);
+                drive.driving(speed, false);  // backward
             }
 
             if (flag_run_drive_stop)
             {
                 flag_run_drive_stop = false;
-                stopMotor();
+                drive.brake();
             }
 
             /* ---------- Steering commands ---------- */
@@ -526,20 +611,16 @@ void IDLE_process(void *parameter)
             if (flag_disable_steer)
             {
                 flag_disable_steer = false;
-                if (servo.attached())
-                    servo.detach();
+                steer.disable();
             }
 
             if (flag_turn_steer)
             {
                 flag_turn_steer = false;
-
-                if (!servo.attached())
-                    servo.attach(SERVO_PIN);
-
+                steer.enable();
                 uint16_t angle = steer_angle;
                 if (angle > 180) angle = 180;
-                servo.write(angle);
+                steer.turn((int)angle);
             }
         }
 
@@ -555,7 +636,8 @@ void OPERATION_process(void *parameter)
 
     speed       = 0;
     steer_angle = 95;
-    if (!servo.attached()) servo.attach(SERVO_PIN);
+    steer.enable();
+    steer.turn((int)steer_angle);
 
     for (;;)
     {
@@ -579,7 +661,7 @@ void OPERATION_process(void *parameter)
                 tick_kickUltra = tick_1ms;
             }
 
-            // Motor & steering
+            // Motor & steering control
             if (flag_op_stop_motor)
             {
                 stopMotor();
@@ -587,10 +669,10 @@ void OPERATION_process(void *parameter)
             }
             else
             {
-                digitalWrite(MOTOR_OUT_1_PIN, HIGH);
-                digitalWrite(MOTOR_OUT_2_PIN, LOW);
-                analogWrite(MOTOR_PWM_PIN, speed);
-                servo.write(steer_angle);
+                drive.driving(speed, true);  // forward in normal operation
+                uint16_t angle = steer_angle;
+                if (angle > 180) angle = 180;
+                steer.turn((int)angle);
             }
         }
         vTaskDelay(1 / portTICK_PERIOD_MS);
@@ -601,20 +683,16 @@ void OPERATION_process(void *parameter)
 
 void driveForward(uint8_t spd)
 {
-    digitalWrite(MOTOR_OUT_1_PIN, HIGH);
-    digitalWrite(MOTOR_OUT_2_PIN, LOW);
-    analogWrite(MOTOR_PWM_PIN, spd);
+    drive.driving(spd, true);
 }
 
 void stopMotor()
 {
-    analogWrite(MOTOR_PWM_PIN, 0);
-    digitalWrite(MOTOR_OUT_1_PIN, LOW);
-    digitalWrite(MOTOR_OUT_2_PIN, LOW);
+    drive.brake();
 }
 
 void setSteerAngle(uint16_t angle)
 {
     if (angle > 180) angle = 180;
-    servo.write(angle);
+    steer.turn((int)angle);
 }
