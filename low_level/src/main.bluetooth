@@ -1,0 +1,199 @@
+#include <Arduino.h>
+#include <ESP32Servo.h>
+#include "bluetooth.hpp"
+
+/** =========================================================================
+ *                           Hardware Definition
+  =========================================================================*/
+#define LINE_SENSOR_IDX_1_PIN 32
+#define LINE_SENSOR_IDX_2_PIN 35
+#define LINE_SENSOR_IDX_3_PIN 34
+#define LINE_SENSOR_IDX_4_PIN 39
+#define LINE_SENSOR_IDX_5_PIN 36
+
+#define ULTRASONIC_TRIG_PIN 26
+#define ULTRASONIC_ECHO_PIN 27
+
+#define MOTOR_PWM_PIN   5
+#define MOTOR_OUT_1_PIN 18
+#define MOTOR_OUT_2_PIN 19
+
+#define SERVO_PIN 23
+
+Network bluetooth("Behind the scream 123");
+
+uint8_t* networkReadBuff;
+uint8_t  line_signals[5] {25,35,84,36,255};
+
+Servo servo;
+static uint16_t angle = 90;
+static uint8_t speed = 0;
+
+void setup()
+{
+  Serial.begin(115200);
+  bluetooth.begin();
+
+  pinMode(LINE_SENSOR_IDX_1_PIN, INPUT);
+  pinMode(LINE_SENSOR_IDX_2_PIN, INPUT);
+  pinMode(LINE_SENSOR_IDX_3_PIN, INPUT);
+  pinMode(LINE_SENSOR_IDX_4_PIN, INPUT);
+  pinMode(LINE_SENSOR_IDX_5_PIN, INPUT);
+
+  pinMode(MOTOR_OUT_1_PIN, OUTPUT);
+  pinMode(MOTOR_OUT_2_PIN, OUTPUT);
+  pinMode(MOTOR_PWM_PIN,   OUTPUT);
+
+  servo.attach(SERVO_PIN);
+
+  Serial.println("Prototype ready");
+}
+
+void loop()
+{  
+  // Đọc 1 byte lệnh, nếu chưa có thì thoát vòng lặp
+  if (!bluetooth.readCmd())
+  {
+    return;
+  }
+
+  uint8_t cmd = bluetooth.getCmd();
+
+  // Debug: xem thực sự ESP32 nhận được gì
+  Serial.print("CMD = 0x");
+  Serial.println(cmd, HEX);
+
+  switch (cmd)
+  {
+    /* =================== DC Motor =================== */
+
+    // Brake (phanh cứng)
+    case 0xDF:
+      analogWrite(MOTOR_PWM_PIN, 0);
+      digitalWrite(MOTOR_OUT_1_PIN, HIGH);
+      digitalWrite(MOTOR_OUT_2_PIN, HIGH);
+      delay(10);
+      digitalWrite(MOTOR_OUT_1_PIN, LOW);
+      digitalWrite(MOTOR_OUT_2_PIN, LOW); 
+
+      // Inform to host
+      bluetooth.transmit(uint8_t(0xEF));
+      bluetooth.clear();
+      break;
+
+    // Stop (free run)
+    case 0xDE:
+      analogWrite(MOTOR_PWM_PIN, 0);
+      digitalWrite(MOTOR_OUT_1_PIN, LOW);
+      digitalWrite(MOTOR_OUT_2_PIN, LOW);
+      
+      bluetooth.transmit(uint8_t(0xEF));
+      bluetooth.clear();
+      break;
+
+    // Forward
+    case 0xDD:
+    {
+      if (!bluetooth.read(1)) break;
+      if (!bluetooth.read_frame_isDone()) break;
+
+      networkReadBuff = bluetooth.getReceiveBuffer();
+      speed = networkReadBuff[0];
+
+      digitalWrite(MOTOR_OUT_1_PIN, HIGH);
+      digitalWrite(MOTOR_OUT_2_PIN, LOW);
+      analogWrite(MOTOR_PWM_PIN, speed);
+
+      bluetooth.transmit(uint8_t(0xEF));
+      bluetooth.clear();
+      break;
+    }
+
+    // Backward
+    case 0xDC:
+    {
+      if (!bluetooth.read(1)) break;
+      if (!bluetooth.read_frame_isDone()) break;
+
+      networkReadBuff = bluetooth.getReceiveBuffer();
+      speed = networkReadBuff[0];
+
+      digitalWrite(MOTOR_OUT_1_PIN, LOW);
+      digitalWrite(MOTOR_OUT_2_PIN, HIGH);
+      analogWrite(MOTOR_PWM_PIN, speed);
+
+      bluetooth.transmit(uint8_t(0xEF));
+      bluetooth.clear();
+      break;
+    }
+
+    // Stop 
+    case 0xDA:
+    {
+      digitalWrite(MOTOR_OUT_1_PIN, LOW);
+      digitalWrite(MOTOR_OUT_2_PIN, LOW);
+      analogWrite(MOTOR_PWM_PIN, 0);
+
+      bluetooth.transmit(uint8_t(0xEF));
+      bluetooth.clear();
+      break;
+    }
+
+    /* =================== Servo =================== */
+
+    case 0xCD:  // turn, payload 2 bytes (hi, lo)
+    {
+      if (!bluetooth.read(2)) break;
+      if (!bluetooth.read_frame_isDone()) break;
+
+      networkReadBuff = bluetooth.getReceiveBuffer();
+      angle = (int16_t)((networkReadBuff[0] << 8) | networkReadBuff[1]);
+
+      Serial.print("Servo angle: ");
+      Serial.println(angle);
+
+      servo.write(angle);
+      
+      bluetooth.transmit(uint8_t(0xEF));
+      bluetooth.clear();
+      break;
+    }
+
+    /* =================== Line Sensor =================== */
+
+    case 0xBF:  // line sensor (no payload)
+    {
+      line_signals[0] = (uint8_t)(analogRead(LINE_SENSOR_IDX_1_PIN) >> 4);
+      line_signals[2] = (uint8_t)(analogRead(LINE_SENSOR_IDX_3_PIN) >> 4);
+      line_signals[1] = (uint8_t)(analogRead(LINE_SENSOR_IDX_2_PIN) >> 4);
+      line_signals[3] = (uint8_t)(analogRead(LINE_SENSOR_IDX_4_PIN) >> 4);
+      line_signals[4] = (uint8_t)(analogRead(LINE_SENSOR_IDX_5_PIN) >> 4);
+
+      // Debug trên Serial
+      Serial.print("Line signals: ");
+      for (int i = 0; i < 5; i++)
+      {
+        Serial.print(line_signals[i]);
+        Serial.print(' ');
+      }
+      Serial.println();
+
+      // 1 frame duy nhất: [cmd][5 byte tín hiệu]
+      uint8_t txPayload[6];
+      txPayload[0] = uint8_t(0xEF);          // ACK byte
+      memcpy(&txPayload[1], line_signals, 5);
+
+      bluetooth.transmit(txPayload, 6);
+      bluetooth.clear();
+      break;
+    }
+
+    /* =================== Default =================== */
+    // Invalid command
+    default:
+      
+      bluetooth.transmit(0xE0);  // error code
+      bluetooth.clear();
+      break;
+  }
+}

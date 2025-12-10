@@ -1,0 +1,552 @@
+#include <Arduino.h>
+#include <math.h>
+#include <BluetoothSerial.h>
+#include <string>
+
+#include "actuators.hpp"
+#include "command.hpp"
+#include "sensors.hpp"
+
+/** =========================================================================
+ *                           Hardware Definition
+  =========================================================================*/
+
+// Line sensor pin definition
+#define LINE_SENSOR_IDX_1_PIN 32
+#define LINE_SENSOR_IDX_2_PIN 34
+#define LINE_SENSOR_IDX_3_PIN 35
+#define LINE_SENSOR_IDX_4_PIN 39
+#define LINE_SENSOR_IDX_5_PIN 36
+
+// MPU pin definition
+#define MPU_SDA_PIN 21
+#define MPU_SCL_PIN 22
+#define MPU_ADDRESS 0x68
+
+// Ultra-sonic sensor definition
+#define ULTRASONIC_TRIG_PIN 26
+#define ULTRASONIC_ECHO_PIN 27
+#define ULTRASONIC_TRIGGER_PERIOD_MS 60
+
+// DC motor | Encoder definition
+#define MOTOR_PWM_PIN   5
+#define MOTOR_OUT_1_PIN 18
+#define MOTOR_OUT_2_PIN 19
+
+#define ENCODER_CHANNEL_A_PIN 25
+#define ENCODER_CHANNEL_B_PIN 33
+#define ENCODER_RESOLUTION 22
+#define ENCODER_TIMEOUT_TO_CALCULATE_SPEED 1000 // 1 s (ms)
+
+// Servo definition
+#define SERVO_PIN 23
+
+// Acuator init
+Actuators::Drive drive
+(
+  MOTOR_OUT_1_PIN,                      // Motor pin out 1
+  MOTOR_OUT_2_PIN,                      // Motor pin out 2
+  MOTOR_PWM_PIN,                        // Motor pwm pin
+  ENCODER_CHANNEL_A_PIN,                // Motor channel 1 pin
+  ENCODER_CHANNEL_B_PIN,                // Motor channel 2 pin
+  ENCODER_RESOLUTION,                   // Encoder resolution
+  ENCODER_TIMEOUT_TO_CALCULATE_SPEED    // Timeout for calculate speed -> to check error
+);
+
+Actuators::Steer steer(SERVO_PIN);
+
+// Sensor init
+Sensors sensors
+( 
+  LINE_SENSOR_IDX_1_PIN,          // Line sensor pin 1
+  LINE_SENSOR_IDX_2_PIN,          // Line sensor pin 2
+  LINE_SENSOR_IDX_3_PIN,          // Line sensor pin 3
+  LINE_SENSOR_IDX_4_PIN,          // Line sensor pin 4
+  LINE_SENSOR_IDX_5_PIN,          // Line sensor pin 5
+  ULTRASONIC_ECHO_PIN,            // Ultrasonic pin Echo
+  ULTRASONIC_TRIG_PIN,            // Ultrasonic pin Trig
+  ULTRASONIC_TRIGGER_PERIOD_MS,   // Ultrasonic trigger period
+  MPU_SDA_PIN,                    // MPU I2C
+  MPU_SCL_PIN                     // MPU I2C
+);
+
+// Interrupt definitions
+void IRAM_ATTR ultrasonic_echo_isr_wrapper()
+{
+    sensors.ultra->echo_ISR();   
+}
+
+void IRAM_ATTR encoder_channel_A_isr_wrapper()
+{
+  drive.Endcoder_channel_A_ISR(); // Channel A
+}
+
+void IRAM_ATTR encoder_channel_B_isr_wrapper()
+{
+  drive.Endcoder_channel_B_ISR(); // Channel B
+}
+
+/** =========================================================================
+ *                           Network definition
+  =========================================================================*/
+
+// Check wheter bluetooth is enable
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
+#endif
+#if !defined(CONFIG_BT_SPP_ENABLED)
+#error Serial Bluetooth not available or not enabled. It is only available for the ESP32 chip.
+#endif
+
+// Bluetooth create 
+BluetoothSerial bluetooth;
+
+// Network buffer
+String networks_receive_buffer;
+char networks_send_buffer[10];
+static String rx_line;
+static bool   rx_line_ready = false;
+
+unsigned long bluetooth_timer = 0;
+void bluetooth_read();
+void bluetooth_send(char* str);
+
+/** =========================================================================
+ *                           System definition
+  =========================================================================*/
+
+// Create mode
+enum mode {IDLE_MODE,           // Starting mode:   Do nothing until connect to client
+           PASSIVE_MODE,        // Passive mode:    Run functions according to command from gui
+           OPERATING_MODE};     // Operating mode:  Fully operate all functions of the robot     
+
+volatile unsigned long robot_timer = 0;
+static mode robot_mode = IDLE_MODE;
+
+// Create execute mode
+void processPassiveCommand();
+void processOperationCommand();
+void processIdleCommand();
+
+void setup()
+{
+  // Hardware setup
+
+  // ======= Network declaration =======
+  bluetooth.begin("Appolo from the moon");
+  bluetooth.setPin("52374");
+
+  Serial.begin(115200);
+
+  // Init command
+  initPassiveCommandTable();
+  initOperationCommandTable();
+  initIdleCommandTable();
+}
+
+void loop()
+{
+  // Read bluetooth signal
+  bluetooth_read();
+  if (!rx_line_ready) return; // End of loop if there is no available frame is received
+  
+
+  switch (robot_mode)
+  {
+    case IDLE_MODE:
+      // Setup
+
+
+      // Read signal
+      processIdleCommand();
+    break;
+
+    case PASSIVE_MODE:
+      // Read signal
+      processPassiveCommand();
+    break;
+
+    case OPERATING_MODE:
+      // Setup
+
+
+      // Read signal
+      processOperationCommand();
+    break;
+  }
+}
+
+
+/** =========================================================================
+ *                           Bluetooth fucntion
+  =========================================================================*/
+
+// Bluetooth read
+
+void bluetooth_read()
+{
+  while (bluetooth.available())
+  {
+    char c = (char)bluetooth.read();
+    Serial.print("From desktop: ");
+    Serial.println(c);
+    if (c == '\n')
+    {
+      // End a frame
+      rx_line_ready = true;
+      networks_receive_buffer = rx_line; 
+      rx_line = "";
+      Serial.print("Valid string: ");
+      Serial.println(networks_receive_buffer);                  
+    }
+    else
+    {
+      rx_line += c;   
+
+      if (rx_line.length() > 64)
+      {
+        rx_line = "";
+      }
+    }
+  }
+}
+
+void bluetooth_send(char* str)
+{
+  // Check for bluetooth connection
+  if (!bluetooth.connected())
+  {
+    return;
+  }
+
+  bluetooth.print(str);
+  bluetooth.print('\n');
+}
+
+
+/** =========================================================================
+ *                           Handler fucntions
+  =========================================================================*/
+
+void processPassiveCommand()
+{
+  size_t n = networks_receive_buffer.length();
+  if (n < 1) return;                  // no command
+
+  uint8_t cmd = (uint8_t)networks_receive_buffer[0];
+  uint8_t* payload = (uint8_t*)networks_receive_buffer.c_str() + 1;
+  uint8_t payload_len = (n >= 1) ? (uint8_t)(n - 1) : 0;
+
+  dispatchPassiveCommand(cmd, payload, payload_len);
+    // Clear bufer
+  networks_receive_buffer = "";
+}
+
+void processOperationCommand()
+{
+  size_t n = networks_receive_buffer.length();
+  if (n < 1) return;
+
+  uint8_t cmd = (uint8_t)networks_receive_buffer[0];
+  uint8_t* payload = (uint8_t*)networks_receive_buffer.c_str() + 1;
+  uint8_t payload_len = (n >= 1) ? (uint8_t)(n - 1) : 0;
+  dispatchOperationCommand(cmd, payload, payload_len);
+    // Clear bufer
+  networks_receive_buffer = "";
+}
+
+void processIdleCommand()
+{
+  size_t n = networks_receive_buffer.length();
+  if (n < 1) return;
+
+  uint8_t cmd = (uint8_t)networks_receive_buffer[0];
+  uint8_t* payload = (uint8_t*)networks_receive_buffer.c_str() + 1;
+  uint8_t payload_len = (n >= 1) ? (uint8_t)(n - 1) : 0;
+
+  dispatchIdleCommand(cmd, payload, payload_len);
+  // Clear bufer
+  networks_receive_buffer = "";
+}
+
+
+void handleEmergencyStop(uint8_t* payload, uint8_t len)
+{
+  // Disable actuator
+  drive.brake();
+  drive.disable();
+  steer.disable();
+  // Change robot mode
+  robot_mode = IDLE_MODE;
+
+  Serial.println(F("=== HANDLE SYSTEM COMMAND ==="));
+  Serial.println(F("Type        : SYSTEM"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_SYSTEM_EMERGENCY_STOP));
+}
+
+void handleChangeMode(uint8_t* payload, uint8_t len)
+{
+  switch(payload[0])
+  {
+    // Change to Idle mode
+    case 0:
+      if (robot_mode == OPERATING_MODE)
+      {
+        detachInterrupt(digitalPinToInterrupt(ULTRASONIC_ECHO_PIN));
+        detachInterrupt(digitalPinToInterrupt(ENCODER_CHANNEL_A_PIN));
+        detachInterrupt(digitalPinToInterrupt(ENCODER_CHANNEL_B_PIN));
+      }
+
+      robot_mode = IDLE_MODE;
+      
+      // Setup for Idle mode
+      drive.disable();
+      steer.disable();
+      break;
+
+    // Change to Passive mode
+    case 1:
+      robot_mode = PASSIVE_MODE;
+
+      // Setup for Passive mode
+      drive.disable();
+      steer.disable();
+      break;
+
+    // Setup for Operation mode
+    case 2:
+      if (robot_mode != OPERATING_MODE)
+      {
+        attachInterrupt(digitalPinToInterrupt(ULTRASONIC_ECHO_PIN),ultrasonic_echo_isr_wrapper,CHANGE);
+        attachInterrupt(digitalPinToInterrupt(ENCODER_CHANNEL_A_PIN),encoder_channel_A_isr_wrapper,CHANGE);
+        attachInterrupt(digitalPinToInterrupt(ENCODER_CHANNEL_B_PIN),encoder_channel_B_isr_wrapper,CHANGE);  
+      }
+    
+      robot_mode = OPERATING_MODE;
+
+      // Setup for Operation mode
+      drive.disable();
+      steer.disable();
+      break;
+
+    default:
+      return;
+    break;
+  }
+
+  Serial.println(F("=== HANDLE SYSTEM COMMAND ==="));
+  Serial.println(F("Type        : SYSTEM"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_SYSTEM_CHANGE_MODE));
+
+  // Ping mode back
+  handlePingMode(payload,len);
+}
+
+void handlePingMode(uint8_t* payload, uint8_t len)
+{
+  Serial.println(F("=== HANDLE SYSTEM COMMAND ==="));
+  Serial.println(F("Type        : SYSTEM"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_SYSTEM_PING_MODE));
+
+  char buf[8];
+  sprintf(buf, "%d", (int)robot_mode);   // "0", "1", "2"
+  bluetooth_send(buf);
+}
+
+void handleSendAllSignal(uint8_t* payload, uint8_t len)
+{
+  Serial.println(F("=== HANDLE SYSTEM COMMAND ==="));
+  Serial.println(F("Type        : SYSTEM"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_SYSTEM_SEND_ALL_SIGNAL));
+
+  sensors.extract_signals();
+}
+
+
+// ===== CONTROL HANDLERS =====
+void handleMoveForward(uint8_t* payload, uint8_t len)
+{
+  Serial.println(F("=== HANDLE CONTROL COMMAND ==="));
+  Serial.println(F("Type        : CONTROL"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_CONTROL_MOVE_FORWARD));
+
+  drive.driving((uint8_t)payload[0], true);
+  steer.turn((int16_t)(payload[1] << 8 | payload[2]));
+}
+
+void handleMoveBackward(uint8_t* payload, uint8_t len)
+{
+  Serial.println(F("=== HANDLE CONTROL COMMAND ==="));
+  Serial.println(F("Type        : CONTROL"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_CONTROL_MOVE_BACKWARD));
+
+  drive.driving((uint8_t)payload[0], false);
+  steer.turn((int16_t)(payload[1] << 8 | payload[2]));
+}
+
+void handleBrake(uint8_t* payload, uint8_t len)
+{
+  Serial.println(F("=== HANDLE CONTROL COMMAND ==="));
+  Serial.println(F("Type        : CONTROL"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_CONTROL_BRAKE));
+
+  drive.brake();
+  steer.disable();
+}
+
+
+// ===== DRIVE HANDLERS =====
+void handleDriveDisable(uint8_t* payload, uint8_t len)
+{
+  Serial.println(F("=== HANDLE DRIVE COMMAND ==="));
+  Serial.println(F("Type        : DRIVE"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_DRIVE_DISABLE));
+
+  drive.disable();
+}
+
+void handleDriveEnable(uint8_t* payload, uint8_t len)
+{
+  Serial.println(F("=== HANDLE DRIVE COMMAND ==="));
+  Serial.println(F("Type        : DRIVE"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_DRIVE_ENABLE));
+
+  drive.enable();
+}
+
+void handleDriveRotateForward(uint8_t* payload, uint8_t len)
+{
+  Serial.println(F("=== HANDLE DRIVE COMMAND ==="));
+  Serial.println(F("Type        : DRIVE"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_DRIVE_ROTATE_FORWARD));
+
+  drive.driving((uint8_t)payload[1], true);
+}
+
+void handleDriveRotateBackward(uint8_t* payload, uint8_t len)
+{
+  Serial.println(F("=== HANDLE DRIVE COMMAND ==="));
+  Serial.println(F("Type        : DRIVE"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_DRIVE_ROTATE_BACKWARD));
+
+  drive.driving((uint8_t)payload[1], false);
+}
+
+void handleDriveBrake(uint8_t* payload, uint8_t len)
+{
+  Serial.println(F("=== HANDLE DRIVE COMMAND ==="));
+  Serial.println(F("Type        : DRIVE"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_DRIVE_BRAKE));
+
+  drive.brake();
+}
+
+
+// ===== STEER HANDLERS =====
+void handleSteerDisable(uint8_t* payload, uint8_t len)
+{
+  Serial.println(F("=== HANDLE STEER COMMAND ==="));
+  Serial.println(F("Type        : STEER"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_STEER_DISABLE));
+
+  steer.disable();
+}
+
+void handleSteerEnable(uint8_t* payload, uint8_t len)
+{
+  Serial.println(F("=== HANDLE STEER COMMAND ==="));
+  Serial.println(F("Type        : STEER"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_STEER_ENABLE));
+
+  
+  steer.enable();
+}
+
+void handleSteerTurn(uint8_t* payload, uint8_t len)
+{
+  Serial.println(F("=== HANDLE STEER COMMAND ==="));
+  Serial.println(F("Type        : STEER"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_STEER_TURN));
+
+  // Check wherer there is any payload
+  if (len < 3) return;
+  steer.turn((int16_t)(payload[1] << 8 | payload[2]));
+}
+
+
+// ===== SENSOR HANDLERS =====
+void handleLineSensor(uint8_t* payload, uint8_t len)
+{
+  Serial.println(F("=== HANDLE SENSOR COMMAND ==="));
+  Serial.println(F("Type        : SENSOR"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_LINE_SENSOR));
+
+  sensors.line->read_signal();
+  bluetooth_send(sensors.line->extract_signal());
+    Serial.print("Line following: ");
+}
+
+void handleUltrasonicSignal(uint8_t* payload, uint8_t len)
+{
+  Serial.println(F("=== HANDLE SENSOR COMMAND ==="));
+  Serial.println(F("Type        : SENSOR"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_ULTRASONIC_SIGNAL));
+  
+  attachInterrupt(digitalPinToInterrupt(ULTRASONIC_ECHO_PIN),ultrasonic_echo_isr_wrapper,CHANGE);
+  while (!(sensors.ultra->trigger_isAvailable()));
+
+  sensors.ultra->kick_trigger();
+  delay(ULTRASONIC_TRIGGER_PERIOD_MS + 10);
+  bluetooth_send(sensors.ultra->extract_signal());
+  detachInterrupt(digitalPinToInterrupt(ULTRASONIC_ECHO_PIN));
+
+  Serial.print("Ultra: ");
+  Serial.println(sensors.ultra->get_signal());
+}
+
+void handleMPUAccel(uint8_t* payload, uint8_t len)
+{
+  Serial.println(F("=== HANDLE SENSOR COMMAND ==="));
+  Serial.println(F("Type        : SENSOR"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_MPU_GYRO_SIGNAL));
+
+  sensors.mpu->get_signal();
+  bluetooth_send(sensors.mpu->extract_signal());
+}
+
+void handleMPUGyro(uint8_t* payload, uint8_t len)
+{
+  Serial.println(F("=== HANDLE SENSOR COMMAND ==="));
+  Serial.println(F("Type        : SENSOR"));
+  Serial.print  (F("Command code: "));
+  Serial.println(static_cast<uint8_t>(COMMAND_MPU_GYRO_SIGNAL));
+
+  sensors.mpu->get_signal();
+  bluetooth_send(sensors.mpu->extract_signal());
+}
+
+void handleUnknownCommand(uint8_t* payload, uint8_t len)
+{
+  Serial.println(F("=== HANDLE UNKNOWN COMMAND ==="));
+  Serial.println(F("Type        : UNKNOWN"));
+  Serial.println(F("Command code: (unknown at handler)"));
+  (void)payload;
+}

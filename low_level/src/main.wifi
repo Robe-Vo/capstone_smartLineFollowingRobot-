@@ -1,0 +1,533 @@
+#include <Arduino.h>
+#include <ESP32Servo.h>
+
+#include "network.hpp"
+#include "sensors.hpp"
+#include "actuators.hpp"
+
+#define LINE_SENSOR_IDX_1_PIN 32
+#define LINE_SENSOR_IDX_2_PIN 35
+#define LINE_SENSOR_IDX_3_PIN 34
+#define LINE_SENSOR_IDX_4_PIN 39
+#define LINE_SENSOR_IDX_5_PIN 36
+
+#define ULTRASONIC_TRIG_PIN 26
+#define ULTRASONIC_ECHO_PIN 27
+
+#define MOTOR_PWM_PIN   5
+#define MOTOR_OUT_1_PIN 18
+#define MOTOR_OUT_2_PIN 19
+
+#define SERVO_PIN 23
+TaskHandle_t Task1;
+/* ======================= SENSORS ======================= */
+
+// line_readSignals() returns pointer to 5 bytes
+uint8_t*  line_signals = nullptr;
+
+// ultrasonic distance (unit depends on your ultra code)
+uint16_t ultra_signal = 0;
+
+// MPU processed signals
+uint16_t mpu_signals[6] = {0};
+
+
+/* ======================= ACTUATORS ======================= */
+Servo servo;
+
+
+/* ======================= COMMUNICATION ======================= */
+Network server(5946);
+static uint8_t  cmd          = 0x00;
+static uint8_t  speed        = 0;
+static uint16_t steer_angle  = 90;
+
+/* Robot operation system */
+enum mode { IDLE_MODE, OPERATION_MODE };
+volatile mode robot_mode = IDLE_MODE;
+
+/* ======================= SCHEDULE FLAGS ======================= */
+
+volatile bool flag_idle_comm       = false;  // IDLE comm frame
+volatile bool flag_operation_frame = false;  // OPERATION full frame
+
+// Periods (µs)
+const uint32_t IDLE_COMM_PERIOD_US   = 5000;  // 5 ms (IDLE mode)
+const uint32_t OP_FRAME_PERIOD_US    = 100000;  // 5 ms (OPERATION frame period)
+
+// For ultrasonic trigger in OPERATION
+const uint32_t ULTRA_FRAME_INTERVAL  = 12;    // #frames between new measurements (~60 ms if frame=5 ms)
+
+// Safety margin inside a frame: we only kick TRIG if we have this much time left
+const uint32_t ULTRA_KICK_SAFETY_US  = 200;   // 0.2 ms slack
+
+/* ======================= TIMER ======================= */
+hw_timer_t *Timer0_Cfg = NULL;
+void IRAM_ATTR Timer0_ISR();
+
+/* ======================= HANDLERS ======================= */
+
+void Handler_communicateIdle();    // IDLE-only comm
+void Handler_operationFrame();     // OPERATION full frame
+
+// helpers
+void changeToOperationMode();
+void changeToIdleMode();
+void driveForward(uint8_t speed);
+void stopMotor();
+void setSteerAngle(uint16_t angle);
+
+/* ======================= SETUP ======================= */
+
+void setup()
+{
+    Serial.begin(115200);
+
+    // Sensor setup
+    line_setup(LINE_SENSOR_IDX_1_PIN,
+               LINE_SENSOR_IDX_2_PIN,
+               LINE_SENSOR_IDX_3_PIN,
+               LINE_SENSOR_IDX_4_PIN,
+               LINE_SENSOR_IDX_5_PIN);
+
+    ultra_setup(ULTRASONIC_TRIG_PIN, ULTRASONIC_ECHO_PIN);
+    // mpu_setup(21, 22);   // SDA, SCL – change if needed
+
+    // Echo ISR
+    attachInterrupt(ULTRASONIC_ECHO_PIN, hanlder_ultra_echo, CHANGE);
+
+    // Network setup
+    Serial.println("Start to configurate network");
+    while (!server.begin())
+    {
+        Serial.println("Configuration failed");
+        delay(1000);
+    }
+
+    // Timer interrupt setup: 1 ms tick (80 MHz / 80 = 1 MHz → 1000 ticks = 1 ms)
+    Timer0_Cfg = timerBegin(0, 80, true);
+    timerAttachInterrupt(Timer0_Cfg, &Timer0_ISR, true);
+    timerAlarmWrite(Timer0_Cfg, 1000, true);  // 1 ms period
+    timerAlarmEnable(Timer0_Cfg);
+
+    robot_mode = IDLE_MODE;
+}
+
+/* ======================= MAIN LOOP ======================= */
+
+void loop()
+{
+    
+    if (robot_mode == IDLE_MODE)
+    {
+        Handler_communicateIdle();
+    } else if (robot_mode == OPERATION_MODE)
+    {
+        if (flag_operation_frame)
+        {
+            flag_operation_frame = false;
+            Handler_operationFrame();
+        }    
+    }
+}
+
+/* ======================= TIMER ISR ======================= */
+
+void IRAM_ATTR Timer0_ISR()
+{
+    static uint32_t tick_us = 0;
+    tick_us += 1000;   // 1 ms
+
+    if (robot_mode == IDLE_MODE)
+    {
+        if (tick_us % IDLE_COMM_PERIOD_US == 0)
+        {
+            flag_idle_comm = true;
+        }
+    }
+    else if (robot_mode == OPERATION_MODE)
+    {
+        if (tick_us % OP_FRAME_PERIOD_US == 0)
+        {
+            flag_operation_frame = true;
+        }
+    }
+
+    // wrap
+    if (tick_us >= 1000000000UL)
+    {
+        tick_us = 0;
+    }
+}
+
+/* ======================= IDLE COMMUNICATION ======================= */
+/*
+ * One command at a time:
+ *  - Read 1 byte command
+ *  - Execute
+ *  - Send ACK 0x20 (and payload if needed)
+ */
+
+void Handler_communicateIdle()
+{
+    uint8_t c;
+    if (!server.getUint8(c))
+        return;   // no command
+
+    cmd = c;
+    Serial.print("IDLE cmd: 0x");
+    Serial.println(cmd, HEX);
+
+    switch (cmd)
+    {
+        /* -------- System Commands -------- */
+
+        // Change mode -> OPERATION
+        case 0xFF:
+            if (!server.transmitUint8(0x20)) {
+                Serial.println("TX ACK failed");
+            }
+            changeToOperationMode();
+            break;
+
+        // Change mode -> IDLE (already IDLE, but keep for symmetry)
+        case 0xFE:
+            changeToIdleMode();
+            stopMotor();
+            if (!server.transmitUint8(0x20)) {
+                Serial.println("TX ACK failed");
+            }
+            
+            break;
+
+        /* -------- Sensor Commands -------- */
+
+        // Read line sensor (5 bytes)
+        case 0xEF:
+        {
+            uint8_t* ls = line_readSignals();
+            server.transmitUint8(0x20);              // ACK
+            server.transmitArrayUint8(ls, 5);
+            break;
+        }
+
+        // Read ultrasonic (2 bytes, big-endian)
+        case 0xEE:
+        {
+            uint16_t d = ultra_getSignal();
+            uint8_t buf[2];
+            buf[0] = (uint8_t)(d >> 8);
+            buf[1] = (uint8_t)(d & 0xFF);
+
+            if (!server.transmitUint8(0x20)) {
+                Serial.println("TX ACK failed");
+            }              // ACK
+            server.transmitArrayUint8(buf, 2);
+            break;
+        }
+
+        // Read MPU signals (6 × uint16)
+        // case 0xED:
+        // {
+        //     uint16_t* p = mpu_getSignals();
+        //     uint8_t  buf[12];
+
+        //     for (int i = 0; i < 6; ++i)
+        //     {
+        //         buf[2 * i]     = (uint8_t)(p[i] >> 8);
+        //         buf[2 * i + 1] = (uint8_t)(p[i] & 0xFF);
+        //     }
+
+        //     if (!server.transmitUint8(0x20)) {
+            //     Serial.println("TX ACK failed");
+            // }              // ACK
+        //     server.transmitArrayUint8(buf, 12);
+        //     break;
+        // }
+
+        /* -------- Drive / Servo Commands -------- */
+
+        // Forward with speed
+        case 0xDF:
+        {
+            uint8_t spd;
+            if (server.getUint8(spd))
+            {
+                driveForward(spd);
+                speed = spd;   // remember last speed
+                if (!server.transmitUint8(0x20)) {
+                    Serial.println("TX ACK failed");
+                }        // ACK
+            }
+            break;
+        }
+
+        // Backward with speed (simple, no controller)
+        case 0xDE:
+        {
+            uint8_t spd;
+            if (server.getUint8(spd))
+            {
+                pinMode(MOTOR_OUT_1_PIN, OUTPUT);
+                pinMode(MOTOR_OUT_2_PIN, OUTPUT);
+                pinMode(MOTOR_PWM_PIN,   OUTPUT);
+
+                digitalWrite(MOTOR_OUT_1_PIN, LOW);
+                digitalWrite(MOTOR_OUT_2_PIN, HIGH);
+                analogWrite(MOTOR_PWM_PIN, spd);
+
+                speed = spd;
+                if (!server.transmitUint8(0x20)) {
+                    Serial.println("TX ACK failed");
+                }          // ACK
+            }
+            break;
+        }
+
+        // Stop motor
+        case 0xDD:
+            stopMotor();
+            speed = 0;
+            if (!server.transmitUint8(0x20)) {
+                Serial.println("TX ACK failed");
+            }              // ACK
+            break;
+
+        // Disable steer (detach servo)
+        case 0xDC:
+            if (servo.attached())
+                servo.detach();
+            if (!server.transmitUint8(0x20)) {
+                Serial.println("TX ACK failed");
+            }              // ACK
+            break;
+
+        // Set steering angle (2 bytes)
+        case 0xDB:
+        {
+            uint8_t buf[2];
+            if (server.getArrayUint8(buf, 2))
+            {
+                uint16_t a = (uint16_t(buf[0]) << 8) | uint16_t(buf[1]);
+                steer_angle = a;
+                setSteerAngle(steer_angle);
+                if (!server.transmitUint8(0x20)) {
+                    Serial.println("TX ACK failed");
+                }          // ACK
+            }
+            break;
+        }
+
+        default:
+            // Unknown command
+            break;
+    }
+
+    cmd = 0x00;
+}
+
+/* ======================= OPERATION FRAME ======================= */
+/*
+ * One frame does (fixed sampling time OP_FRAME_PERIOD_US):
+ *  1. read line sensors
+ *  2. read ultra signal (get only)
+ *  3. read MPU signals
+ *  4. send 19-byte sensor frame
+ *  5. read 4-byte control frame [cmd][speed][angle_H][angle_L] and execute
+ *  6. drive motor + servo
+ *  7. (if time left in frame) kick ultrasonic trigger (HIGH in one frame, LOW in next)
+ */
+
+void Handler_operationFrame()
+{
+    if (robot_mode != OPERATION_MODE)
+        return;
+
+    static uint32_t frame_counter = 0;
+    frame_counter++;
+
+    // ===== 1) Mark frame computation start (excluding network waiting) =====
+    uint32_t t_frame_start = micros();
+
+    // ===== 2) Apply latest control to motor + servo =====
+    // 'speed' and 'steer_angle' are global variables updated from last control frame
+    analogWrite(MOTOR_PWM_PIN, speed);
+    servo.write(steer_angle);
+
+    // ===== 3) Sample sensors at this precise time instant =====
+    // ---- 3.1) Line sensors ----
+    line_signals = line_readSignals();
+
+    // ---- 3.2) Ultrasonic ----
+    ultra_signal = ultra_getSignal();
+
+    // ---- 3.3) MPU (optional) ----
+    // {
+    //     uint16_t* p = mpu_getSignals();
+    //     for (int i = 0; i < 6; ++i)
+    //         mpu_signals[i] = p[i];
+    // }
+
+    // ===== 4) Build 19-byte sensor frame and send to PC =====
+    uint8_t frame[19];
+
+    // 5 bytes: line signals
+    for (int i = 0; i < 5; ++i)
+        frame[i] = line_signals ? line_signals[i] : 0;
+
+    // 2 bytes: ultrasonic
+    frame[5] = (uint8_t)(ultra_signal >> 8);
+    frame[6] = (uint8_t)(ultra_signal & 0xFF);
+
+    // 12 bytes: 6 × MPU (uint16), if you enable MPU
+    // for (int i = 0; i < 6; ++i)
+    // {
+    //     frame[7 + 2 * i]     = (uint8_t)(mpu_signals[i] >> 8);
+    //     frame[7 + 2 * i + 1] = (uint8_t)(mpu_signals[i] & 0xFF);
+    // }
+
+    server.transmitArrayUint8(frame, 19);
+
+    // ===== 5) Non-blocking check for new 4-byte control frame from PC =====
+    // Robot is MASTER: never block here (sampling period controlled only by robot)
+    uint8_t ctrl[4];
+    if (server.getArrayUint8(ctrl, 4))  // should return true only if 4 bytes available
+    {
+        uint8_t  c     = ctrl[0];
+        uint8_t  spd   = ctrl[1];
+        uint16_t angle = (uint16_t(ctrl[2]) << 8) | uint16_t(ctrl[3]);
+
+        switch (c)
+        {
+            case 0xF0: // stop
+                stopMotor();
+                speed = 0;
+                // keep steer_angle or center:
+                // steer_angle = 90;
+                break;
+
+            case 0xF1: // forward + steering
+                speed       = spd;
+                steer_angle = angle;
+                digitalWrite(MOTOR_OUT_1_PIN, HIGH);
+                digitalWrite(MOTOR_OUT_2_PIN, LOW);
+                if (!servo.attached()) servo.attach(SERVO_PIN);
+                break;
+
+            case 0xFE: // back to IDLE (EXIT OPERATION)
+                changeToIdleMode();
+                stopMotor();
+                // Depending on your protocol you may or may not ACK here.
+                // If you keep the ACK:
+                if (!server.transmitUint8(0x20)) {
+                    Serial.println("TX ACK failed");
+                }
+                return; // end this OP frame handler; next calls will early-return due to mode
+                break;
+
+            default:
+                // Unknown command → ignore, keep last valid speed/angle
+                break;
+        }
+    }
+    // If no new control frame: motors/servo keep last command for next frame.
+
+    // ===== 6) Ultrasonic trigger management (same idea as before) =====
+    uint32_t elapsed_us = micros() - t_frame_start;
+
+    enum UltraTrigState { ULTRA_IDLE, ULTRA_HIGH };
+    static UltraTrigState ultra_state = ULTRA_IDLE;
+    static uint32_t last_ultra_frame = 0;
+
+    // Only start/finish TRIG if we still have time in this frame
+    if (elapsed_us + ULTRA_KICK_SAFETY_US < OP_FRAME_PERIOD_US)
+    {
+        // every ULTRA_FRAME_INTERVAL frames we start a new measurement
+        if (frame_counter - last_ultra_frame >= ULTRA_FRAME_INTERVAL)
+        {
+            if (ultra_state == ULTRA_IDLE)
+            {
+                digitalWrite(ULTRASONIC_TRIG_PIN, HIGH);
+                ultra_state = ULTRA_HIGH;
+            }
+            else if (ultra_state == ULTRA_HIGH)
+            {
+                digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+                ultra_state = ULTRA_IDLE;
+                last_ultra_frame = frame_counter;
+            }
+        }
+    }
+
+    // Optional: debug frame time
+    /*
+    static uint32_t last_print_ms = 0;
+    uint32_t now_ms = millis();
+    if (now_ms - last_print_ms > 500)
+    {
+        last_print_ms = now_ms;
+        Serial.print("OP MASTER frame dt = ");
+        Serial.print(micros() - t_frame_start);
+        Serial.println(" us");
+    }
+    */
+}
+
+/* ======================= MODE & ACTUATOR HELPERS ======================= */
+
+void changeToOperationMode()
+{
+    robot_mode = OPERATION_MODE;
+    Serial.println("Change to OPERATION_MODE");
+    speed = 0;
+    steer_angle = 90;
+    digitalWrite(MOTOR_OUT_1_PIN,HIGH);
+    digitalWrite(MOTOR_OUT_2_PIN,LOW);
+    digitalWrite(MOTOR_PWM_PIN,0);
+    if (!servo.attached()) servo.attach(SERVO_PIN);
+}
+
+void changeToIdleMode()
+{
+    robot_mode = IDLE_MODE;
+    flag_operation_frame = false;
+    Serial.println("Change to IDLE_MODE");
+
+    // Turn of actuators
+    speed = 0;
+    steer_angle = 90;
+    digitalWrite(MOTOR_OUT_1_PIN,LOW);
+    digitalWrite(MOTOR_OUT_2_PIN,LOW);
+    digitalWrite(MOTOR_PWM_PIN,0);
+    if (servo.attached()) servo.detach();
+}
+
+void driveForward(uint8_t spd)
+{
+    pinMode(MOTOR_OUT_1_PIN, OUTPUT);
+    pinMode(MOTOR_OUT_2_PIN, OUTPUT);
+    pinMode(MOTOR_PWM_PIN,   OUTPUT);
+
+    digitalWrite(MOTOR_OUT_1_PIN, HIGH);
+    digitalWrite(MOTOR_OUT_2_PIN, LOW);
+    analogWrite(MOTOR_PWM_PIN, spd);
+}
+
+void stopMotor()
+{
+    pinMode(MOTOR_OUT_1_PIN, OUTPUT);
+    pinMode(MOTOR_OUT_2_PIN, OUTPUT);
+    pinMode(MOTOR_PWM_PIN,   OUTPUT);
+
+    analogWrite(MOTOR_PWM_PIN, 0);
+    digitalWrite(MOTOR_OUT_1_PIN, LOW);
+    digitalWrite(MOTOR_OUT_2_PIN, LOW);
+}
+
+void setSteerAngle(uint16_t angle)
+{
+    if (!servo.attached())
+        servo.attach(SERVO_PIN);
+
+    servo.write(angle);   // make sure angle is in [0,180] in your PC code
+}

@@ -1,0 +1,140 @@
+#include <Arduino.h>
+#include <BluetoothSerial.h>
+
+BluetoothSerial bluetooth;
+
+// ====== PROTOCOL SETTINGS ======
+static const size_t FRAME_BUF_SIZE  = 32;   // max frame size
+static const uint8_t CMD_REQUEST_FRAME = 0xFE; // MATLAB sends this to request data
+
+// Our data frame layout: 5×uint8 + 6×int16 + 1×uint16 = 19 bytes
+static const size_t FRAME_PAYLOAD_LEN = 19;
+
+// ====== Application data (example) ======
+uint8_t  line_bytes[5];     // 5×uint8
+int16_t  mpu_bytes[6];      // 6×int16
+uint16_t ultra_byte;        // 1×uint16
+
+// ========== Bluetooth helpers ==========
+
+// Initialize Bluetooth
+void bt_init()
+{
+    bluetooth.begin("Appolo from the Moon");
+}
+
+// Send a binary frame (payload only), add '\n' terminator
+void bt_send_frame(const uint8_t* data, size_t len)
+{
+    bluetooth.write(data, len);
+    bluetooth.write('\n');   // for MATLAB readline()
+}
+
+// ========== Application-specific helpers ==========
+
+// TODO: fill this with real sensor reads
+void read_robot_signals()
+{
+    // Example dummy values – replace with your real sensor code
+    // 5×uint8: line sensor (e.g., raw ADC flags)
+    line_bytes[0] = 1;
+    line_bytes[1] = 0;
+    line_bytes[2] = 1;
+    line_bytes[3] = 0;
+    line_bytes[4] = 1;
+
+    // 6×int16: MPU data (e.g., ax, ay, az, gx, gy, gz)
+    mpu_bytes[0] = -1596;
+    mpu_bytes[1] = -12158;
+    mpu_bytes[2] = 212;
+    mpu_bytes[3] = 324;
+    mpu_bytes[4] = 234;
+    mpu_bytes[5] = 4232;
+
+    // 1×uint16: ultrasonic distance (mm)
+    ultra_byte = 263;
+}
+
+// Build frame [5×u8 | 6×i16 | 1×u16] into outFrame[]
+void build_signal_frame(uint8_t* outFrame)
+{
+    // Make sure we’re using little-endian consistently with MATLAB.
+    // ESP32 is little-endian, MATLAB typecast() on PC is also little-endian,
+    // so memcpy is safe.
+
+    // 1) Copy 5×uint8 line data
+    memcpy(&outFrame[0], line_bytes, 5);
+
+    // 2) Copy 6×int16 MPU data (12 bytes)
+    memcpy(&outFrame[5], mpu_bytes, 6 * sizeof(int16_t)); // 12 bytes
+
+    // 3) Copy 1×uint16 ultrasonic data (2 bytes)
+    memcpy(&outFrame[17], &ultra_byte, sizeof(uint16_t)); // bytes 17–18
+}
+
+// Send one data frame in your binary format + '\n'
+void send_robot_signal_frame()
+{
+    uint8_t frame[FRAME_PAYLOAD_LEN];
+
+    // Fill application data from sensors
+    read_robot_signals();
+
+    // Pack into binary frame
+    build_signal_frame(frame);
+
+    // Debug print to Serial
+    Serial.print("TX @ ");
+    Serial.print(millis());
+    Serial.print(" ms: ");
+    for (size_t i = 0; i < FRAME_PAYLOAD_LEN; ++i)
+    {
+        Serial.print("0x");
+        if (frame[i] < 0x10) Serial.print('0');
+        Serial.print(frame[i], HEX);
+        Serial.print(' ');
+    }
+    Serial.println();
+
+    // Send over Bluetooth (adds '\n')
+    bt_send_frame(frame, FRAME_PAYLOAD_LEN);
+}
+
+// ========== Arduino core ==========
+
+void setup()
+{
+    Serial.begin(115200);
+    bt_init();
+
+    Serial.println("ESP32 ready. Waiting for 0xFE to send data frame...");
+}
+
+void loop()
+{
+    // Tell us the loop is alive every 1s
+    static uint32_t lastPrint = 0;
+    if (millis() - lastPrint > 1000) {
+        Serial.print("Loop alive at ");
+        Serial.println(millis());
+        lastPrint = millis();
+    }
+
+    // Check for Bluetooth data
+    while (bluetooth.available() > 0)
+    {
+        uint8_t c = bluetooth.read();
+
+        Serial.print("Got BT byte: 0x");
+        if (c < 0x10) Serial.print('0');
+        Serial.println(c, HEX);
+
+        if (c == CMD_REQUEST_FRAME)      // 0xFE
+        {
+            Serial.println(" -> CMD_REQUEST_FRAME detected, sending frame");
+            send_robot_signal_frame();
+        }
+    }
+
+}// no delay()
+
