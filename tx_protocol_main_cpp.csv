@@ -1,0 +1,6 @@
+id_hex,id_dec,direction,name,payload_length_bytes,payload_format,robot_response,notes
+0xF1,241,PC->Robot,SPEED_AND_STEER,2,"[speed (uint8), steer_angle_raw (uint8)]","Not enough data to confirm (not required for control).","Used in OPERATION mode to set DC motor speed and steering servo angle (8-bit)."
+0xFF,255,PC->Robot,ENTER_IDLE,0,"(no payload)","Not enough data to confirm (not required for control).","Puts the robot into IDLE: motor stopped, steering held at safe/center position."
+0xEF,239,PC->Robot,REQUEST_LINE_FRAME,0,"(no payload)","[0x20][s1][s2][s3][s4][s5]; s1..s5 are 5×uint8.","Requests one line-sensor frame. Robot replies with ACK 0x20 and 5×uint8 values."
+0xDB,219,PC->Robot,SET_STEER_ANGLE_U16,2,"[angle_hi (uint8), angle_lo (uint8)]","Not enough data to confirm (not specified in code snippets).","Sends a 16-bit steering angle: angle = (hi << 8) | lo. Used for steering tests."
+0x20,32,Robot->PC,ACK,0,"(no payload after 0x20 in basic ACK)","N/A","ACK byte. At least used as the first byte of the line-sensor response to command 0xEF

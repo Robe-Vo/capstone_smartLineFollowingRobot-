@@ -23,8 +23,7 @@
 #define MOTOR_OUT_2_PIN 19
 
 // SIMPLE ENCODER: use only channel A for speed
-#define ENCODER_CHANNEL_1_PIN  33
-#define ENCODER_CHANNEL_1_PIN  25
+#define ENCODER_PIN     33
 #define ENCODER_PPR     44  // pulses per revolution
 
 #define SERVO_PIN 23
