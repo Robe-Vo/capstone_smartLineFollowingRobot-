@@ -6,10 +6,16 @@ clear; clc; close all;
 
 btName    = "Behind the scream";
 btChannel = 1;
-bt = bluetooth(btName, btChannel);    % adjust syntax if needed
+bt        = bluetooth(btName, btChannel);    % adjust if needed
+bt.Timeout = 1.0;                            % 1 s timeout
 
 writeBytes = @(bytes) write(bt, uint8(bytes), "uint8");
 readBytes  = @(n)     read(bt, n, "uint8");
+
+% --- Flush any leftover data in buffer ---
+if bt.NumBytesAvailable > 0
+    read(bt, bt.NumBytesAvailable, "uint8");
+end
 
 % --- Test configuration ---
 T_total   = 5.0;        % total test time [s]
@@ -30,22 +36,24 @@ y_ultra  = zeros(N, 1, 'uint16');  % ultrasonic distance
 y_pulses = zeros(N, 1, 'uint8');   % encoder pulses/frame
 y_rpm    = zeros(N, 1, 'uint16');  % encoder speed (rpm)
 
-%% 2. Go to IDLE and enable drive (safety)
+%% 2. Go to IDLE and flush ACKs
 
-% Ensure IDLE mode
-writeBytes(hex2dec('FE'));   % FE: change mode -> IDLE (single byte)
+% FE: go to IDLE
+writeBytes(hex2dec('FE'));
 pause(0.05);
+ack = readBytes(1);  %#ok<NASGU>  % should be 0x20
 
-% Disable then enable drive (safety check – optional)
-writeBytes(hex2dec('E2'));   % DISABLE_DRIVE
-pause(0.05);
-writeBytes(hex2dec('E1'));   % ENABLE_DRIVE
-pause(0.05);
+% (optional) clear any extra bytes
+if bt.NumBytesAvailable > 0
+    read(bt, bt.NumBytesAvailable, "uint8");
+end
 
 %% 3. Enter OPERATION mode
 
-writeBytes(hex2dec('FF'));   % FF: IDLE -> OPERATION
-pause(0.1);
+% FF: IDLE -> OPERATION
+writeBytes(hex2dec('FF'));
+pause(0.05);
+ack = readBytes(1);  %#ok<NASGU>  % should be 0x20
 
 %% 4. 5-second loop: send commands + receive 22-byte frames
 
@@ -56,27 +64,34 @@ for k = 1:N
 
     % --- Choose steering angle (change halfway through the test) ---
     if t_log(k) < T_total/2
-        angle_cmd = angle_1;      % first half: angle_1
+        angle_cmd = angle_1;
     else
-        angle_cmd = angle_2;      % second half: angle_2
+        angle_cmd = angle_2;
     end
 
     % --- Build control frame [cmd, speed, angle_hi, angle_lo] ---
-    cmd   = hex2dec('F1');        % forward + steering
-    ang16 = uint16(angle_cmd);
+    cmd    = hex2dec('F1');     % forward + steering
+    ang16  = uint16(angle_cmd);
     ang_hi = bitshift(ang16, -8);
     ang_lo = bitand(ang16, 255);
 
     ctrl_frame = uint8([cmd, speed_cmd, ang_hi, ang_lo]);
 
-    % Send command
+    % --- Send command ---
     writeBytes(ctrl_frame);
 
-    % Read feedback frame (22 bytes)
+    % --- Read feedback frame (22 bytes) ---
     frame_len = 22;
     frame     = readBytes(frame_len);   % uint8[22]
 
+    if numel(frame) ~= frame_len
+        warning('Frame %d: received %d bytes instead of %d.', ...
+                k, numel(frame), frame_len);
+        break;
+    end
+
     % --- Decode frame ---
+
     % Line sensors (5 x uint8)
     y_line(k, :) = frame(1:5);
 
@@ -111,13 +126,10 @@ end
 writeBytes(uint8([hex2dec('F0'), 0, 0, 0]));
 pause(0.1);
 
-% Back to IDLE from OPERATION: [0xFE, 0, 0, 0]
-writeBytes(uint8([hex2dec('FE'), 0, 0, 0]));
-pause(0.1);
-
-% Disable drive (safety)
-writeBytes(hex2dec('E2'));   % DISABLE_DRIVE
+% Back to IDLE from OPERATION: [0xFE]
+writeBytes(hex2dec('FE'));
 pause(0.05);
+ack = readBytes(1);  %#ok<NASGU>  % ACK 0x20
 
 %% 6. Print summary information
 
@@ -129,8 +141,8 @@ speed_d   = double(u_speed);
 angle_d   = double(u_angle);
 
 fprintf('\n=== OPERATION MODE TEST SUMMARY ===\n');
-fprintf('Total frames: %d\n', N);
-fprintf('Total time   : %.3f s\n', t_log(end));
+fprintf('Total frames (logged): %d\n', find(t_log>0,1,'last'));
+fprintf('Total time            : %.3f s\n', t_log(find(t_log>0,1,'last')));
 
 fprintf('\nEncoder pulses/frame:\n');
 fprintf('  min: %.1f, max: %.1f, mean: %.2f\n', ...
@@ -149,19 +161,23 @@ fprintf('  unique values: ');
 fprintf('%.1f ', unique(angle_d));
 fprintf('\n');
 
-fprintf('\nTest finished successfully.\n');
+fprintf('\nTest finished.\n');
 
 %% 7. Plot some markable signals
 
+valid_idx = t_log > 0;
+t_s       = t_log(valid_idx);
+
+rpm_d_v     = rpm_d(valid_idx);
+pulses_d_v  = pulses_d(valid_idx);
+angle_d_v   = angle_d(valid_idx);
+
 figure('Name','Operation Mode Test','NumberTitle','off');
-
-t_s = t_log;   % time axis [s]
-
 tiledlayout(3,1);
 
 % --- Plot encoder rpm ---
 nexttile;
-plot(t_s, rpm_d, '-o');
+plot(t_s, rpm_d_v, '-o');
 grid on;
 xlabel('Time [s]');
 ylabel('Speed [rpm]');
@@ -169,7 +185,7 @@ title('Encoder speed (rpm)');
 
 % --- Plot encoder pulses per frame ---
 nexttile;
-stem(t_s, pulses_d, 'filled');
+stem(t_s, pulses_d_v, 'filled');
 grid on;
 xlabel('Time [s]');
 ylabel('Pulses / frame');
@@ -177,14 +193,11 @@ title('Encoder pulses per frame');
 
 % --- Plot steering angle command ---
 nexttile;
-plot(t_s, angle_d, '-o');
+plot(t_s, angle_d_v, '-o');
 grid on;
 xlabel('Time [s]');
 ylabel('Angle command [deg]');
 title('Steering angle command');
-ylim([min(angle_d)-5, max(angle_d)+5]);
-
-% You can additionally inspect line sensors or ultrasonic if needed:
-% e.g., plot y_line(:,3) as center sensor, or y_ultra vs time.
+ylim([min(angle_d_v)-5, max(angle_d_v)+5]);
 
 clear bt;
