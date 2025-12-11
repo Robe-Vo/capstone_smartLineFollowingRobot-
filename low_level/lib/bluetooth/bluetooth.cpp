@@ -87,7 +87,7 @@ bool Network::begin()
     Serial.println("Starting Bluetooth SPP...");
 
     // Change this name if you want a different Bluetooth device name
-    const char* deviceName = "Behind the scream123";
+    const char* deviceName = "Behind the scream";
 
     if (!bt.begin(deviceName))
     {

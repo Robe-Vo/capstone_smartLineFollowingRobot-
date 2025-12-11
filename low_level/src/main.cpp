@@ -59,7 +59,7 @@ static uint8_t  cmd         = 0x00;
 static uint8_t* payload     = nullptr;
 
 static uint8_t  speed       = 0;
-static uint16_t steer_angle = 90;
+static uint16_t steer_angle = 75;
 
 static volatile bool flag_read_line          = false;
 static volatile bool flag_read_ultra         = false;
