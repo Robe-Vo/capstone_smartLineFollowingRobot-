@@ -1,0 +1,63 @@
+Danh sách thực nghiệm bạn đưa ra là đầy đủ cho mục tiêu: lọc nhiễu tốc độ, xác định tham số hệ, và thiết kế bộ điều khiển bám chuyển động. Không thiếu hạng mục cốt lõi. Dưới đây là cấu trúc thực nghiệm tối thiểu và thứ tự hợp lý nhất để đảm bảo mỗi bước có dữ liệu đầu vào đủ tin cậy.
+
+Thực nghiệm xác định đặc tính cơ bản
+Mục đích: biết được vùng chết, vùng điều khiển hữu dụng.
+Thao tác tối thiểu:
+• Ramp tăng nhỏ từ 0 → duty_max, ghi lại tốc độ.
+• Xác định deadband, tốc độ min, tốc độ max.
+• Đánh giá độ lặp lại (ít nhất đo 3 lần).
+
+Thực nghiệm step để khảo sát động học và nhiễu
+Mục đích: thu dữ liệu để kiểm tra nhiễu tốc độ và cấu trúc bộ lọc cần thiết.
+Thao tác tối thiểu:
+• Thực hiện step input với nhiều mức: 20%, 40%, 60%, 80%.
+• Thu data thô tốc độ từ ESP32.
+• Áp dụng cửa sổ lọc, median, trimmed mean trên MATLAB.
+• Lặp lại thu thập sau lọc để chọn N, M tối ưu.
+Số lần: 1 bộ step test là đủ, nhưng nên lặp lại 2–3 lần để chắc chắn tính ổn định.
+
+Thực nghiệm đánh giá ảnh hưởng góc lái đến tốc độ
+Hệ Ackermann có thể làm động cơ tải nặng hơn khi đổi góc lái.
+Mục đích: biết hệ có decoupling hay không.
+Thao tác tối thiểu:
+• Giữ duty cố định, đổi góc lái theo 0°, 10°, 20°, 30°, đo tốc độ.
+• Thực hiện khi ramp và step.
+Nếu sự thay đổi < 5–7% tốc độ → có thể xem như độc lập.
+Nếu lớn hơn → cần bù trong bộ điều khiển.
+
+Thực nghiệm tìm hàm truyền hoặc state-space
+Mục đích: mô hình hóa hệ để thiết kế điều khiển tốt hơn.
+Thao tác tối thiểu:
+• Loại bỏ vùng deadband (từ thí nghiệm 1).
+• Thực hiện random step hoặc random ramp (PRBS, stair-random).
+• Thu data nhiều mức vận tốc nhưng tránh saturate.
+• Dùng System Identification Toolbox để thu được TF hoặc SS.
+• Verify bằng một bộ dữ liệu khác không dùng trong fitting.
+Số lần:
+– 1 lần input để fit, 1 lần khác để verify là đủ.
+– Nếu verify sai lệch lớn, chạy thêm 1 test nữa.
+
+Thiết kế bộ điều khiển
+Mục đích: hoàn chỉnh vòng tốc độ và vòng vị trí.
+• Dựa trên mô hình đã xác định.
+• Có thể cần thêm lọc tốc độ (từ bước 2).
+Không cần thực nghiệm riêng.
+
+Thực nghiệm kiểm chứng bộ điều khiển
+Mục đích: đánh giá thực tế, confirm tracking performance.
+Thao tác tối thiểu:
+• Test step reference → kiểm tra overshoot, thời gian đáp ứng.
+• Test ramp reference → kiểm tra độ trễ và nhiễu.
+• Test motion profile (S-curve hoặc trapezoid) → kiểm tra khả năng bám theo profile.
+• Test khi có thay đổi góc lái (từ bước 3).
+Số lần: 2–3 bộ kiểm chứng.
+
+Tổng số lượng thực nghiệm tối thiểu
+• Ramp xác định deadband: 1
+• Step test thu nhiễu: 2–3
+• Test góc lái: 1
+• Input để fit mô hình: 1
+• Input để verify mô hình: 1
+• Kiểm chứng điều khiển: 2–3
+
+Tổng: khoảng 8–10 thực nghiệm là đủ để có hệ điều khiển tin cậy.
