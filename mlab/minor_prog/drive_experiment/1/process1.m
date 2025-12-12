@@ -1,23 +1,16 @@
-%% 1. Load dữ liệu từ các file rampResult<i>.mat
+%% 1. Gom dữ liệu các lần thí nghiệm vào cell
 
-fileNames = { ...
-    'rampResult1.mat', ...
-    'rampResult2.mat', ...
-    'rampResult3.mat', ...
-    'rampResult4.mat'};
+expAll = { ...
+    rampResult1, ...
+    rampResult2, ...
+    rampResult3, ...
+    rampResult4};
 
-nExp   = numel(fileNames);
-expAll = cell(1,nExp);
-
-for k = 1:nExp
-    S  = load(fileNames{k});          % load struct trong file
-    fn = fieldnames(S);               % lấy tên biến bên trong
-    expAll{k} = S.(fn{1});            % lưu struct vào cell
-end
+nExp = numel(expAll);
 
 % Tham số người dùng
-nIdleSamples = 30;    % số mẫu đầu để ước lượng nhiễu
-kNoiseStd    = 3;     % hệ số nhân std để đặt ngưỡng rpm
+nIdleSamples = 30;    % số mẫu đầu để ước lượng nhiễu rpm khi đứng yên
+kNoiseStd    = 3;     % hệ số nhân std để đặt ngưỡng
 showFigures  = true;  % bật/tắt vẽ hình
 
 
@@ -117,7 +110,7 @@ u_db_neg_all = [deadbandPerExp.u_db_neg];
 pos_valid = u_db_pos_all(~isnan(u_db_pos_all));
 neg_valid = u_db_neg_all(~isnan(u_db_neg_all));
 
-% Tham số phát hiện ngoại lai (IQR)
+% Tham số phát hiện ngoại lai (IQR – Tukey fences)
 kOut = 1.5;
 
 % Phía dương
@@ -148,8 +141,6 @@ else
     neg_inliers = [];
 end
 
-% Thống kê: mean (thô) và median robust (bỏ ngoại lai)
-
 % Mean “thô”
 if ~isempty(pos_valid)
     u_db_pos_mean = mean(pos_valid);
@@ -163,7 +154,7 @@ else
     u_db_neg_mean = NaN;
 end
 
-% Median robust
+% Median robust (bỏ ngoại lai)
 if ~isempty(pos_inliers)
     u_db_pos_med_robust = median(pos_inliers);
 else

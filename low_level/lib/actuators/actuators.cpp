@@ -287,3 +287,100 @@ void Actuators::Steer::disable()
         servo.detach();
     }
 }
+
+namespace Encoder {
+
+    struct SpeedFilterState {
+        float   buffer[SPEED_FILTER_MAX_WINDOW];
+        uint8_t windowLen;   // N thực tế đang dùng
+        uint8_t index;       // vị trí ghi tiếp theo
+        uint8_t count;       // số mẫu hợp lệ hiện có (<= windowLen)
+        float   sum;         // tổng các mẫu trong cửa sổ
+    };
+
+    static SpeedFilterState speedFilter;
+
+    // Chuẩn hóa windowLen và reset trạng thái bộ lọc
+    static void resetFilterState(uint8_t windowLen)
+    {
+        if (windowLen < SPEED_FILTER_MIN_WINDOW) {
+            windowLen = SPEED_FILTER_MIN_WINDOW;
+        }
+        if (windowLen > SPEED_FILTER_MAX_WINDOW) {
+            windowLen = SPEED_FILTER_MAX_WINDOW;
+        }
+
+        speedFilter.windowLen = windowLen;
+        speedFilter.index     = 0;
+        speedFilter.count     = 0;
+        speedFilter.sum       = 0.0f;
+
+        for (uint8_t i = 0; i < SPEED_FILTER_MAX_WINDOW; ++i) {
+            speedFilter.buffer[i] = 0.0f;
+        }
+    }
+
+    void initSpeedFilter(uint8_t windowLen)
+    {
+        resetFilterState(windowLen);
+    }
+
+    void setSpeedFilterWindow(uint8_t windowLen)
+    {
+        // Mỗi lần đổi N → reset để tránh sum bị lệch
+        resetFilterState(windowLen);
+    }
+
+    uint8_t getSpeedFilterWindow()
+    {
+        return speedFilter.windowLen;
+    }
+
+    float updateSpeedFilter(float rpm_sample)
+    {
+        uint8_t N = speedFilter.windowLen;
+
+        // Trường hợp N = 1: không lọc, trả về trực tiếp
+        if (N <= 1) {
+            speedFilter.buffer[0] = rpm_sample;
+            speedFilter.sum       = rpm_sample;
+            speedFilter.count     = 1;
+            speedFilter.index     = 0;
+            return rpm_sample;
+        }
+
+        if (speedFilter.count < N) {
+            // Đang fill cửa sổ lần đầu
+            speedFilter.sum += rpm_sample;
+            speedFilter.buffer[speedFilter.index] = rpm_sample;
+
+            speedFilter.index++;
+            if (speedFilter.index >= N) {
+                speedFilter.index = 0;
+            }
+
+            speedFilter.count++;
+        } else {
+            // Đã đủ N mẫu: thay thế mẫu cũ nhất
+            float oldSample = speedFilter.buffer[speedFilter.index];
+            speedFilter.sum -= oldSample;
+            speedFilter.buffer[speedFilter.index] = rpm_sample;
+            speedFilter.sum += rpm_sample;
+
+            speedFilter.index++;
+            if (speedFilter.index >= N) {
+                speedFilter.index = 0;
+            }
+        }
+
+        float denom = (speedFilter.count < N) ? static_cast<float>(speedFilter.count)
+                                            : static_cast<float>(N);
+
+        if (denom <= 0.0f) {
+            return rpm_sample;
+        }
+
+        return speedFilter.sum / denom;
+    }
+
+} // namespace Actuator

@@ -3,6 +3,7 @@
 
 #include "bluetooth.hpp"
 #include "sensors.hpp"
+#include "actuators.hpp"
 
 /* ======================= CONFIG ======================= */
 
@@ -152,6 +153,9 @@ void setup()
     }
     Serial.println("[SETUP] Network configured");
 
+    // -------- Speed filter setup --------
+    Encoder::initSpeedFilter();
+
     /* -------- Timer interrupt setup: 1 ms tick -------- */
     Timer0_Cfg = timerBegin(0, 80, true);      // 80 MHz / 80 = 1 MHz
     timerAttachInterrupt(Timer0_Cfg, &Timer0_ISR, true);
@@ -286,6 +290,20 @@ void com_process(void *parameter)
                             flag_read_mpu = true;
                             break;
 
+                        case 0xEC:
+                        {
+                            uint8_t win;
+                            if (server.getUint8(win)) {
+                                // Cho phép N >=1, <= MAX; phần clamp nằm trong Actuator
+                                Encoder::setSpeedFilterWindow(win);
+                                Serial.print("Set speed filter window = ");
+                                Serial.println(Encoder::getSpeedFilterWindow());
+                            } else {
+                                ok = false;
+                            }
+                            break;
+                        }
+
                         /* -------- Drive / Servo Commands -------- */
 
                         // [0xDF] [speed] : forward
@@ -407,33 +425,31 @@ void com_process(void *parameter)
                             break;
                     }
 
-                    // ======= LẤY XUNG + RESET =======
+                    // 1) Take pulses and reset frame counter
                     int32_t pulses;
                     noInterrupts();
                     pulses = encoder_pulse_frame;
                     encoder_pulse_frame = 0;
                     interrupts();
 
-                    // ======= TÍNH TỐC ĐỘ RPM =======
-                    uint32_t now_ms = tick_1ms;
-                    uint32_t dt_ms  = (last_frame_ms == 0)
-                                      ? TIME_SEND_SIGNAL
-                                      : (now_ms - last_frame_ms);
-                    if (dt_ms == 0) dt_ms = TIME_SEND_SIGNAL;
-                    last_frame_ms = now_ms;
-
+                    // 2) Compute speed from pulses per TIME_SEND_SIGNAL
                     float pulses_f     = (float)pulses;
-                    float pulses_per_s = pulses_f * (1000.0f / (float)dt_ms);
+                    float pulses_per_s = pulses_f * (1000.0f / (float)TIME_SEND_SIGNAL);
                     float rev_per_s    = pulses_per_s / (float)ENCODER_PPR;
                     float rpm          = rev_per_s * 60.0f;
-                    if (rpm < 0.0f) rpm = 0.0f;
-                    encoder_speed = rpm;
 
-                    Serial.print("[OPE FRAME] pulses=");
+                    if (rpm < 0.0f) rpm = 0.0f; // single channel -> no direction
+
+                    // 3) Apply moving-average filter (window N chỉnh bằng 0xEC)
+                    float rpm_filt = Encoder::updateSpeedFilter(rpm);
+                    encoder_speed  = rpm_filt;
+
+                    // Debug to Serial
+                    Serial.print("[ENC] pulses_frame=");
                     Serial.print(pulses);
-                    Serial.print(" dt_ms=");
-                    Serial.print(dt_ms);
-                    Serial.print(" rpm=");
+                    Serial.print(" rpm_raw=");
+                    Serial.print(rpm);
+                    Serial.print(" rpm_filt=");
                     Serial.println(encoder_speed);
 
                     // ======= ĐỌC SENSOR =======

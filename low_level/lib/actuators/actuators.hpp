@@ -7,7 +7,7 @@
 
 #include <Arduino.h>
 #include <ESP32Servo.h>
-
+#include <stdint.h>
 class Actuators
 {
 public:
@@ -98,3 +98,24 @@ public:
         void enable();
     };
 };
+
+
+namespace Encoder {
+
+    constexpr uint8_t SPEED_FILTER_MIN_WINDOW     = 1;
+    constexpr uint8_t SPEED_FILTER_MAX_WINDOW     = 20;
+    constexpr uint8_t SPEED_FILTER_DEFAULT_WINDOW = 1;  // =1 -> không lọc, giữ nguyên như code cũ
+
+    // Khởi tạo bộ lọc tốc độ (gọi 1 lần trong setup)
+    void initSpeedFilter(uint8_t windowLen = SPEED_FILTER_DEFAULT_WINDOW);
+
+    // Đổi độ rộng cửa sổ lọc (gọi từ lệnh 0xEC trong IDLE mode)
+    void setSpeedFilterWindow(uint8_t windowLen);
+
+    // Đọc lại độ rộng cửa sổ hiện tại (nếu cần debug)
+    uint8_t getSpeedFilterWindow();
+
+    // Cập nhật bộ lọc với 1 mẫu tốc độ (rpm) mới, trả về rpm đã lọc
+    float updateSpeedFilter(float rpm_sample);
+
+} // namespace Actuator
