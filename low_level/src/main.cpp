@@ -12,7 +12,7 @@
 #define TIME_KICK_ULTRA    60   // ms
 
 // Chu kỳ vòng tốc độ & vị trí (có thể chỉnh)
-#define TS_SPEED_MS        10   // ms, speed loop + encoder accumulation
+#define TS_SPEED_MS        50   // ms, speed loop + encoder accumulation
 #define TS_POSITION_MS     500  // ms, position loop (chưa dùng PID nhưng chuẩn bị sẵn)
 
 /* ======================= PIN MAPPING ======================= */
@@ -360,6 +360,8 @@ void IRAM_ATTR ISR_encoder_A() {
 }
 
 void IRAM_ATTR ISR_encoder_B() {
+    encoder_pulse_total++;
+    encoder_pulse_frame++;
 #if DEBUG_ENCODER_ISR
     static uint32_t lastPrintB = 0;
     uint32_t now = micros();
