@@ -290,6 +290,11 @@ void Actuators::Steer::disable()
 
 // encoder_pulse_total phải được khai báo ở main.cpp
 extern volatile int32_t encoder_pulse_total;
+static uint8_t  N = 1;
+static float    rpmBuf[MAX_N];
+static uint8_t  idx = 0;
+static float    rpmFilt = 0.0f;
+
 
 namespace Encoder
 {

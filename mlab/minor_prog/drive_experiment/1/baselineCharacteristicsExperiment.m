@@ -14,9 +14,11 @@ clear; clc; close all;
 btName    = "Behind the scream";
 btChannel = 1;
 
+N = 1;
+
 T_wait    = 1.0;                  % thời gian chờ trong OPERATION, speed = 0
-T_up      = 10.0;                 % ramp-up duration [s]
-T_down    = 10.0;                 % ramp-down duration [s]
+T_up      = 5.0;                 % ramp-up duration [s]
+T_down    = 5.0;                 % ramp-down duration [s]
 T_total   = T_up + T_down;        % 20 s tổng thời gian ramp
 T_all     = T_wait + T_total;     % tổng thời gian (chờ + ramp)
 
@@ -25,7 +27,7 @@ nSteps    = floor(T_all / Ts_frame);
 
 CMD_FWD   = uint8(hex2dec('F1')); % 0xF1: forward + steering
 CMD_STOP  = uint8(hex2dec('F0')); % 0xF0: stop
-angleDeg  = uint16(74);           % góc servo cố định = 76 deg
+angleDeg  = uint16(75);           % góc servo cố định = 76 deg
 
 FRAME_LEN = 22;                   % độ dài frame phản hồi từ main.cpp
 
@@ -35,6 +37,9 @@ bt = bluetooth(btName, btChannel);
 bt.Timeout = 1.0;      % [s]
 
 % Xóa buffer cũ nếu có
+
+write(bt,[0xEC N],"uint8")
+
 if bt.NumBytesAvailable > 0
     read(bt, bt.NumBytesAvailable, "uint8");
 end
