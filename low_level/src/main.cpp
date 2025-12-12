@@ -1,3 +1,4 @@
+// ======================= main.cpp =======================
 #include <Arduino.h>
 #include <ESP32Servo.h>
 #include "bluetooth.hpp"
@@ -8,8 +9,10 @@
 #define TIME_SEND_SIGNAL   50   // ms, chu kỳ frame PC
 #define TIME_KICK_ULTRA    60   // ms
 
-#define TS_SPEED_MS        50   // ms, speed loop (dùng period measurement)
-#define TS_POSITION_MS     500  // ms, position loop (chưa dùng PID)
+#define TS_SPEED_MS        20   // ms, chu kỳ cập nhật tốc độ (lọc EMA/IIR)
+#define TS_POSITION_MS     200  // ms, chu kỳ vòng vị trí (chưa dùng PID)
+
+#define ENCODER_TIMEOUT_MS 200  // ms, quá lâu không có xung -> rpm = 0
 
 #define LINE_SENSOR_IDX_5_PIN 32
 #define LINE_SENSOR_IDX_4_PIN 35
@@ -24,6 +27,7 @@
 #define MOTOR_OUT_1_PIN 18
 #define MOTOR_OUT_2_PIN 19
 
+// Encoder: quadrature, dùng cả A/B, cả cạnh lên/xuống
 #define ENCODER_CHANNEL_A_PIN 33
 #define ENCODER_CHANNEL_B_PIN 25
 #define ENCODER_PPR           44   // pulses / rev đã nhân 4 cạnh
@@ -33,101 +37,26 @@
 #define DEBUG_ENCODER_ISR 0
 
 /* ======================= ENCODER GLOBAL STATE ======================= */
-// Tổng xung (dùng cho quãng đường, frame)
+// Tổng xung (dùng cho quãng đường + tính pulses/frame)
 volatile int32_t encoder_pulse_total  = 0;
-static volatile int32_t encoder_pulse_frame = 0;
+static  int32_t  encoder_pulse_total_prev = 0;
+static  int32_t  encoder_pulse_frame      = 0;
+
+// Quadrature state
+static volatile uint8_t enc_prev_state   = 0;
+static volatile int8_t  encoder_direction = +1;
 
 // Period measurement
-static volatile uint32_t enc_last_edge_us   = 0;   // thời điểm cạnh trước
-static volatile uint32_t enc_period_us      = 0;   // period mới nhất
-static volatile uint32_t enc_last_pulse_ms  = 0;   // tick_1ms tại cạnh gần nhất
-static volatile bool     enc_period_valid   = false;
-
-/* ======================= ENCODER NAMESPACE ======================= */
-namespace Encoder
-{
-    // Cấu hình
-    static uint16_t g_encoderPPR   = 44;
-    static float    g_alpha        = 0.3f;   // IIR
-    static uint32_t g_timeout_ms   = 200;    // nếu quá lâu không có xung -> rpm=0
-    static uint8_t  g_filterN      = 1;      // N logic cho alpha
-
-    // Trạng thái
-    static float    g_rpm_filt     = 0.0f;
-
-    void speed_init(uint16_t ppr, float alpha, uint32_t timeout_ms)
-    {
-        if (ppr == 0) ppr = 1;
-        g_encoderPPR = ppr;
-
-        if (alpha < 0.0f) alpha = 0.0f;
-        if (alpha > 1.0f) alpha = 1.0f;
-        g_alpha = alpha;
-
-        if (timeout_ms < 10) timeout_ms = 10;
-        g_timeout_ms = timeout_ms;
-
-        g_filterN  = 1;
-        g_rpm_filt = 0.0f;
-    }
-
-    // N dùng để chỉnh alpha đơn giản: alpha = 1/N
-    void speed_setFilterWindow(uint8_t N)
-    {
-        if (N == 0) N = 1;
-        if (N > 32) N = 32;
-        g_filterN = N;
-        g_alpha   = 1.0f / (float)N;
-    }
-
-    uint8_t speed_getFilterWindow()
-    {
-        return g_filterN;
-    }
-
-    // Cập nhật tốc độ theo period; now_ms = tick_1ms hiện tại
-    void speed_update_period(uint32_t now_ms)
-    {
-        uint32_t T_us;
-        bool     valid;
-        uint32_t lastPulseMs;
-
-        noInterrupts();
-        T_us         = enc_period_us;
-        valid        = enc_period_valid;
-        enc_period_valid = false;        // đã dùng period này
-        lastPulseMs  = enc_last_pulse_ms;
-        interrupts();
-
-        float rpm_raw = g_rpm_filt;
-
-        if (valid && T_us > 0)
-        {
-            rpm_raw = (60.0f * 1e6f) / ((float)g_encoderPPR * (float)T_us);
-        }
-        else
-        {
-            uint32_t dt_ms = now_ms - lastPulseMs;
-            if (dt_ms > g_timeout_ms)
-                rpm_raw = 0.0f;          // coi như đã dừng
-            // nếu chưa timeout: giữ rpm_raw cũ
-        }
-
-        g_rpm_filt = g_alpha * rpm_raw + (1.0f - g_alpha) * g_rpm_filt;
-    }
-
-    float speed_get_rpm()
-    {
-        return g_rpm_filt;
-    }
-} // namespace Encoder
+static volatile uint32_t enc_last_edge_us   = 0;   // thời điểm cạnh hợp lệ trước
+static volatile uint32_t enc_period_us      = 0;   // period mới nhất (us)
+static volatile uint32_t enc_last_pulse_ms  = 0;   // tick_1ms tại xung hợp lệ mới nhất
 
 /* ======================= SENSORS ======================= */
 uint8_t* line_signals = nullptr;
 uint16_t ultra_signal = 0;
 uint16_t mpu_signals[6] = {0};
 
-/* ======================= ACTUATORS ======================= */
+/* ======================= ACTUATORS (servo trong main) ======================= */
 Servo servo;
 
 /* ======================= COMMUNICATION ======================= */
@@ -176,8 +105,7 @@ void OPERATION_process(void *parameter);
 void com_process(void *parameter);
 
 /* ======================= ENCODER ISRs ======================= */
-void IRAM_ATTR ISR_encoder_A();
-void IRAM_ATTR ISR_encoder_B();
+void IRAM_ATTR ISR_encoder_AB();
 
 /* ======================= HELPERS ======================= */
 void driveForward(uint8_t spd);
@@ -191,6 +119,7 @@ void setup() {
     Serial.println();
     Serial.println("[SETUP] Booting...");
 
+    // -------- Sensors --------
     line_setup(LINE_SENSOR_IDX_1_PIN,
                LINE_SENSOR_IDX_2_PIN,
                LINE_SENSOR_IDX_3_PIN,
@@ -200,23 +129,33 @@ void setup() {
     ultra_setup(ULTRASONIC_TRIG_PIN, ULTRASONIC_ECHO_PIN);
     attachInterrupt(ULTRASONIC_ECHO_PIN, hanlder_ultra_echo, CHANGE);
 
+    // -------- Actuators --------
     pinMode(MOTOR_OUT_1_PIN, OUTPUT);
     pinMode(MOTOR_OUT_2_PIN, OUTPUT);
-    pinMode(MOTOR_PWM_PIN, OUTPUT);
+    pinMode(MOTOR_PWM_PIN,   OUTPUT);
 
     servo.attach(SERVO_PIN);
     servo.write(steer_angle);
     stopMotor();
 
+    // -------- Encoder (quadrature, cả A/B, cả cạnh) --------
     pinMode(ENCODER_CHANNEL_A_PIN, INPUT_PULLUP);
     pinMode(ENCODER_CHANNEL_B_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(ENCODER_CHANNEL_A_PIN), ISR_encoder_A, RISING);
-    attachInterrupt(digitalPinToInterrupt(ENCODER_CHANNEL_B_PIN), ISR_encoder_B, CHANGE);
-    Serial.println("[SETUP] Encoder interrupts attached");
 
-    Encoder::speed_init(ENCODER_PPR, 0.3f, 200);   // alpha, timeout
-    Encoder::speed_setFilterWindow(3);             // alpha = 1/3 mặc định
+    uint8_t a0 = digitalRead(ENCODER_CHANNEL_A_PIN) ? 1 : 0;
+    uint8_t b0 = digitalRead(ENCODER_CHANNEL_B_PIN) ? 1 : 0;
+    enc_prev_state = (a0 << 1) | b0;
 
+    attachInterrupt(digitalPinToInterrupt(ENCODER_CHANNEL_A_PIN), ISR_encoder_AB, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_CHANNEL_B_PIN), ISR_encoder_AB, CHANGE);
+    Serial.println("[SETUP] Encoder quadrature interrupts attached");
+
+    // -------- Bộ lọc tốc độ (EMA + IIR bậc 2) --------
+    Encoder::speed_filter_init();
+    // Mặc định: mode = EMA bậc 1, alpha = 0.3, beta = 0.0
+    Encoder::speed_filter_config(0, 300, 0);
+
+    // -------- Network --------
     Serial.println("[SETUP] Start to configurate network");
     while (!server.begin()) {
         Serial.println("[SETUP] Configuration failed");
@@ -224,21 +163,23 @@ void setup() {
     }
     Serial.println("[SETUP] Network configured");
 
-    Timer0_Cfg = timerBegin(0, 80, true); // 1 MHz
+    // -------- Timer 1 ms --------
+    Timer0_Cfg = timerBegin(0, 80, true);      // 80 MHz / 80 = 1 MHz
     timerAttachInterrupt(Timer0_Cfg, &Timer0_ISR, true);
-    timerAlarmWrite(Timer0_Cfg, 1000, true); // 1 ms
+    timerAlarmWrite(Timer0_Cfg, 1000, true);   // 1000 ticks = 1 ms
     timerAlarmEnable(Timer0_Cfg);
 
     robot_mode = IDLE_MODE;
     Serial.println("[SETUP] Robot in IDLE_MODE");
 
-    xTaskCreatePinnedToCore(com_process, "com_process", 10000, NULL, 1, &COM_handle, 0);
-    xTaskCreatePinnedToCore(IDLE_process,"IDLE_process",10000,NULL,1,&IDLE_handle,1);
-    xTaskCreatePinnedToCore(OPERATION_process,"OPERATION_process",10000,NULL,1,&OPERATION_handle,1);
+    // -------- FreeRTOS Tasks --------
+    xTaskCreatePinnedToCore(com_process,      "com_process",      10000, NULL, 1, &COM_handle,      0);
+    xTaskCreatePinnedToCore(IDLE_process,     "IDLE_process",     10000, NULL, 1, &IDLE_handle,     1);
+    xTaskCreatePinnedToCore(OPERATION_process,"OPERATION_process",10000, NULL, 1, &OPERATION_handle,1);
 }
 
 void loop() {
-    // dùng FreeRTOS
+    // dùng FreeRTOS, không code trong loop
 }
 
 /* ======================= TIMER ISR ======================= */
@@ -261,43 +202,54 @@ void IRAM_ATTR Timer0_ISR() {
     }
 }
 
-/* ======================= ENCODER ISRs ======================= */
-void IRAM_ATTR ISR_encoder_A() {
-    uint32_t now = micros();
-    uint32_t dt  = now - enc_last_edge_us;
-    enc_last_edge_us = now;
+/* ======================= ENCODER ISR (quadrature + period) ======================= */
+void IRAM_ATTR ISR_encoder_AB() {
+    uint32_t now_us = micros();
 
-    encoder_pulse_total++;
-    encoder_pulse_frame++;
+    uint8_t a = gpio_get_level((gpio_num_t)ENCODER_CHANNEL_A_PIN) ? 1 : 0;
+    uint8_t b = gpio_get_level((gpio_num_t)ENCODER_CHANNEL_B_PIN) ? 1 : 0;
+    uint8_t newState = (a << 1) | b;
 
-    if (dt > 50) {                  // bỏ glitch < 50 us
-        enc_period_us     = dt;
-        enc_period_valid  = true;
-        enc_last_pulse_ms = tick_1ms;
-    }
+    // Bảng chuyển trạng thái quadrature 4x
+    // states: 00,01,11,10 = 0,1,3,2 (lưu ý Gray code)
+    static const int8_t quad_table[4][4] = {
+        // new:  0   1   2   3  (we use 0,1,2,3 indexing but state 2,3 mapping depends on wiring)
+        /*old=0*/ {  0, +1, -1,  0 },
+        /*old=1*/ { -1,  0,  0, +1 },
+        /*old=2*/ { +1,  0,  0, -1 },
+        /*old=3*/ {  0, -1, +1,  0 }
+    };
+
+    uint8_t oldState = enc_prev_state & 0x03;
+    int8_t step = quad_table[oldState][newState & 0x03];
+
+    enc_prev_state = newState;
+
+    if (step != 0) {
+        encoder_pulse_total  += step;
+        encoder_pulse_frame  += step;
+        encoder_direction     = (step > 0) ? +1 : -1;
+
+        uint32_t dt = now_us - enc_last_edge_us;
+        enc_last_edge_us = now_us;
+
+        // bỏ glitch quá nhanh (dt quá nhỏ)
+        if (dt > 50) {
+            enc_period_us     = dt;
+            enc_last_pulse_ms = tick_1ms;
+        }
 
 #if DEBUG_ENCODER_ISR
-    static uint32_t lastPrintA = 0;
-    if (now - lastPrintA > 10000) {
-        ets_printf("[ENC A] total=%d frame=%d\n",
-                   (int)encoder_pulse_total,
-                   (int)encoder_pulse_frame);
-        lastPrintA = now;
-    }
+        static uint32_t lastPrint = 0;
+        if (now_us - lastPrint > 10000) {
+            ets_printf("[ENC] tot=%d frame=%d step=%d\n",
+                       (int)encoder_pulse_total,
+                       (int)encoder_pulse_frame,
+                       (int)step);
+            lastPrint = now_us;
+        }
 #endif
-}
-
-void IRAM_ATTR ISR_encoder_B() {
-#if DEBUG_ENCODER_ISR
-    static uint32_t lastPrintB = 0;
-    uint32_t now = micros();
-    if (now - lastPrintB > 20000) {
-        int levelA = gpio_get_level((gpio_num_t)ENCODER_CHANNEL_A_PIN);
-        int levelB = gpio_get_level((gpio_num_t)ENCODER_CHANNEL_B_PIN);
-        ets_printf("[ENC B] A=%d B=%d\n", levelA, levelB);
-        lastPrintB = now;
     }
-#endif
 }
 
 /* ======================= COMMUNICATION TASK ======================= */
@@ -312,16 +264,17 @@ void com_process(void *parameter) {
                 bool ok = true;
 
                 switch (c) {
-                case 0xFF:
+                case 0xFF: // IDLE -> OPERATION
                     robot_mode = OPERATION_MODE;
                     Serial.println("[MODE] Switch to OPERATION_MODE");
                     break;
 
-                case 0xFE:
+                case 0xFE: // stay in IDLE
                     robot_mode = IDLE_MODE;
                     Serial.println("[MODE] Stay in IDLE_MODE");
                     break;
 
+                /* -------- Sensor commands -------- */
                 case 0xEF:
                     flag_read_line = true;
                     break;
@@ -334,60 +287,86 @@ void com_process(void *parameter) {
                     flag_read_mpu = true;
                     break;
 
+                /* -------- Drive / Servo commands -------- */
+                // [0xDF] [speed]
                 case 0xDF: {
                     uint8_t spd;
                     if (server.getUint8(spd)) {
                         speed = spd;
                         flag_run_drive_forward = true;
+                        Serial.print("[IDLE CMD] FWD speed=");
+                        Serial.println(speed);
                     } else ok = false;
                     break;
                 }
 
+                // [0xDE] [speed]
                 case 0xDE: {
                     uint8_t spd;
                     if (server.getUint8(spd)) {
                         speed = spd;
                         flag_run_drive_backward = true;
+                        Serial.print("[IDLE CMD] REV speed=");
+                        Serial.println(speed);
                     } else ok = false;
                     break;
                 }
 
                 case 0xDD:
                     flag_run_drive_stop = true;
+                    Serial.println("[IDLE CMD] STOP");
                     break;
 
                 case 0xDC:
                     flag_disable_steer = true;
                     break;
 
+                // [0xDB] [angle_hi] [angle_lo]
                 case 0xDB: {
                     uint8_t hi, lo;
                     if (server.getUint8(hi) && server.getUint8(lo)) {
-                        steer_angle =
-                            (uint16_t(hi) << 8) | uint16_t(lo);
+                        steer_angle = (uint16_t(hi) << 8) | uint16_t(lo);
                         flag_turn_steer = true;
+                        Serial.print("[IDLE CMD] STEER=");
+                        Serial.println(steer_angle);
                     } else ok = false;
                     break;
                 }
 
-                // 0xEC: chỉnh N của IIR (alpha=1/N)
+                // [0xEC] [m] [a_hi] [a_lo] [b_hi] [b_lo]
+                // m = 0: EMA bậc 1, alpha = a; m = 1: IIR bậc 2 (cascade), alpha=a, beta=b
+                // a_raw,b_raw: uint16, scale 1/1000 (0..1000 -> 0..1.000)
                 case 0xEC: {
-                    uint8_t win;
-                    if (server.getUint8(win)) {
-                        Encoder::speed_setFilterWindow(win);
-                        Serial.print("[IDLE CMD] ENC filter N=");
-                        Serial.println(Encoder::speed_getFilterWindow());
-                    } else ok = false;
+                    uint8_t mode;
+                    uint8_t a_hi, a_lo, b_hi, b_lo;
+                    if (server.getUint8(mode) &&
+                        server.getUint8(a_hi) && server.getUint8(a_lo) &&
+                        server.getUint8(b_hi) && server.getUint8(b_lo)) {
+
+                        uint16_t a_raw = (uint16_t(a_hi) << 8) | uint16_t(a_lo);
+                        uint16_t b_raw = (uint16_t(b_hi) << 8) | uint16_t(b_lo);
+                        Encoder::speed_filter_config(mode, a_raw, b_raw);
+
+                        Serial.print("[IDLE CMD] ENC filter mode=");
+                        Serial.print(mode);
+                        Serial.print(" a_raw=");
+                        Serial.print(a_raw);
+                        Serial.print(" b_raw=");
+                        Serial.println(b_raw);
+                    } else {
+                        ok = false;
+                    }
                     break;
                 }
 
+                // Ping
                 case 0xA0: {
                     uint32_t t_rx = micros();
                     server.transmitUint8(0xA1);
                     uint32_t t_tx = micros();
                     Serial.print("[PING] dt_us = ");
                     Serial.println(t_tx - t_rx);
-                    ok = false;
+                    ok = false; // không trả ACK 0x20
                     break;
                 }
 
@@ -396,13 +375,14 @@ void com_process(void *parameter) {
                 }
 
                 if (ok) {
-                    server.transmitUint8(0x20);
+                    server.transmitUint8(0x20); // ACK
                 }
             }
             break;
         }
 
         case OPERATION_MODE: {
+            // MATLAB gửi 4 byte control [cmd, speed, angle_hi, angle_lo]
             uint8_t ctrl[4];
             if (server.getArrayUint8(ctrl, 4)) {
                 uint8_t c    = ctrl[0];
@@ -410,54 +390,73 @@ void com_process(void *parameter) {
                 uint16_t ang = (uint16_t(ctrl[2]) << 8) | uint16_t(ctrl[3]);
 
                 switch (c) {
-                case 0xF0:
+                case 0xF0: // STOP
                     speed = 0;
                     flag_op_stop_motor = true;
+                    Serial.println("[OPE CMD] STOP");
                     break;
 
-                case 0xF1:
+                case 0xF1: // forward + steering
                     speed       = spd;
                     steer_angle = ang;
+                    Serial.print("[OPE CMD] FWD speed=");
+                    Serial.print(speed);
+                    Serial.print(" angle=");
+                    Serial.println(steer_angle);
                     break;
 
-                case 0xFE:
+                case 0xFE: // back to IDLE
                     robot_mode = IDLE_MODE;
                     server.transmitUint8(0x20);
                     stopMotor();
+                    Serial.println("[MODE] Back to IDLE_MODE from OPERATION");
                     break;
 
                 default:
                     break;
                 }
 
-                int32_t pulses;
+                // Pulses per frame: dựa trên encoder_pulse_total
+                int32_t total_now;
                 noInterrupts();
-                pulses = encoder_pulse_frame;
-                encoder_pulse_frame = 0;
+                total_now = encoder_pulse_total;
                 interrupts();
 
+                int32_t delta = total_now - encoder_pulse_total_prev;
+                encoder_pulse_total_prev = total_now;
+                encoder_pulse_frame      = delta;
+
+                int32_t pulses = encoder_pulse_frame;
+
+                // Đọc line + ultrasonic
                 line_signals = line_readSignals();
                 ultra_signal = ultra_getSignal();
 
-                float spd_f = Encoder::speed_get_rpm();
+                // Lấy tốc độ đã lọc (EMA/IIR)
+                float rpm_filt = Encoder::speed_get_rpm();
 
+                // Build frame 22 byte
                 const uint8_t FRAME_LEN = 22;
                 uint8_t frame[FRAME_LEN] = {0};
 
+                // line sensors
                 for (int i = 0; i < 5; ++i) {
                     frame[i] = line_signals ? line_signals[i] : 0;
                 }
 
+                // ultrasonic
                 frame[5] = (uint8_t)(ultra_signal >> 8);
                 frame[6] = (uint8_t)(ultra_signal & 0xFF);
 
-                if (pulses < 0)   pulses = 0;
+                // pulses per frame (clamp 0..255 magnitude)
+                if (pulses < 0)   pulses = -pulses;   // nếu cần magnitude
                 if (pulses > 255) pulses = 255;
                 frame[19] = (uint8_t)pulses;
 
-                if (spd_f < 0.0f)      spd_f = 0.0f;
-                if (spd_f > 65535.0f)  spd_f = 65535.0f;
-                uint16_t spd_q = (uint16_t)spd_f;
+                // speed (rpm) đã lọc, uint16 big-endian
+                if (rpm_filt < 0.0f)      rpm_filt = -rpm_filt; // gửi magnitude, nếu cần dấu thì mở rộng frame
+                if (rpm_filt > 65535.0f)  rpm_filt = 65535.0f;
+                uint16_t spd_q = (uint16_t)rpm_filt;
                 frame[20] = (uint8_t)(spd_q >> 8);
                 frame[21] = (uint8_t)(spd_q & 0xFF);
 
@@ -550,21 +549,41 @@ void OPERATION_process(void *parameter) {
 
     for (;;) {
         if (robot_mode == OPERATION_MODE) {
+            // Kick ultrasonic
             if ((tick_1ms - tick_kickUltra) >= TIME_KICK_ULTRA) {
                 ultra_kick();
                 tick_kickUltra = tick_1ms;
             }
 
+            // Cập nhật tốc độ thô và lọc EMA/IIR
             if (speed_loop_tick) {
                 speed_loop_tick = false;
-                Encoder::speed_update_period(tick_1ms);
-                // sau này thêm PID tốc độ
+
+                uint32_t now_ms = tick_1ms;
+                uint32_t T_us;
+                uint32_t last_ms;
+                int8_t   dir;
+
+                noInterrupts();
+                T_us    = enc_period_us;
+                last_ms = enc_last_pulse_ms;
+                dir     = encoder_direction;
+                interrupts();
+
+                float rpm_raw = 0.0f;
+
+                if (T_us > 0 && (now_ms - last_ms) <= ENCODER_TIMEOUT_MS) {
+                    float pulses_per_rev = (float)ENCODER_PPR;
+                    float rev_per_sec    = 1.0e6f / (pulses_per_rev * (float)T_us);
+                    rpm_raw              = (dir >= 0 ? 1.0f : -1.0f) * 60.0f * rev_per_sec;
+                } else {
+                    rpm_raw = 0.0f;
+                }
+
+                Encoder::speed_filter_update(rpm_raw);
             }
 
-            if (position_loop_tick) {
-                position_loop_tick = false;
-                // sau này thêm PID vị trí
-            }
+            // Vòng vị trí sẽ thêm sau (position_loop_tick)
 
             if (flag_op_stop_motor) {
                 stopMotor();

@@ -1,27 +1,12 @@
-/**
- *  This is the library for line following robot using two differential drives
- *  and Ackermann mechanism for driving direction.
- */
-
+// ======================= actuators.hpp =======================
 #pragma once
-
 #include <Arduino.h>
-#include <ESP32Servo.h>
-#include <stdint.h>
+
 namespace Encoder
 {
-    void init(uint16_t ppr,
-              uint16_t dt_speed_ms,
-              uint16_t accum_window_ms,
-              float    alpha);
-
-    void updateCount();      // ISR
-    void updateSpeed();      // gọi mỗi dt_speed_ms
-    float getRPM();
-}
-
-namespace Motor
-{
-    void init();
-    void setPWM(int pwm);
+    // mode: 0 = EMA bậc 1, 1 = IIR bậc 2 (cascade 2 EMA)
+    void  speed_filter_init();
+    void  speed_filter_config(uint8_t mode, uint16_t alpha_raw, uint16_t beta_raw);
+    void  speed_filter_update(float rpm_raw);
+    float speed_get_rpm();
 }
