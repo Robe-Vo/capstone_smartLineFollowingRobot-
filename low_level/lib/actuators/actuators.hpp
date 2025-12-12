@@ -100,22 +100,24 @@ public:
 };
 
 
-namespace Encoder {
 
-    constexpr uint8_t SPEED_FILTER_MIN_WINDOW     = 1;
-    constexpr uint8_t SPEED_FILTER_MAX_WINDOW     = 20;
-    constexpr uint8_t SPEED_FILTER_DEFAULT_WINDOW = 1;  // =1 -> không lọc, giữ nguyên như code cũ
 
-    // Khởi tạo bộ lọc tốc độ (gọi 1 lần trong setup)
-    void initSpeedFilter(uint8_t windowLen = SPEED_FILTER_DEFAULT_WINDOW);
+namespace Encoder
+{
+    // Khởi tạo bộ tính tốc độ
+    //  - encoderPPR: số xung / vòng của encoder
+    void speed_init(uint16_t encoderPPR);
 
-    // Đổi độ rộng cửa sổ lọc (gọi từ lệnh 0xEC trong IDLE mode)
-    void setSpeedFilterWindow(uint8_t windowLen);
+    // Cài đặt độ rộng cửa sổ moving-average N
+    //  N = 1  -> không lọc (trả về tốc độ thô)
+    //  1 <= N <= Nmax (giới hạn bên trong)
+    void speed_setFilterWindow(uint8_t N);
+    uint8_t speed_getFilterWindow();
 
-    // Đọc lại độ rộng cửa sổ hiện tại (nếu cần debug)
-    uint8_t getSpeedFilterWindow();
+    // Gọi đều mỗi dt_ms (ví dụ 5 ms) để cập nhật tốc độ
+    //  - dt_ms: khoảng thời gian giữa 2 lần gọi, đơn vị ms
+    void speed_update_ms(uint32_t dt_ms);
 
-    // Cập nhật bộ lọc với 1 mẫu tốc độ (rpm) mới, trả về rpm đã lọc
-    float updateSpeedFilter(float rpm_sample);
-
-} // namespace Actuator
+    // Lấy tốc độ đã lọc (rpm) cho PID / gửi PC
+    float speed_get_rpm();
+}

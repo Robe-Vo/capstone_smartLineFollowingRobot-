@@ -288,99 +288,154 @@ void Actuators::Steer::disable()
     }
 }
 
-namespace Encoder {
+// encoder_pulse_total phải được khai báo ở main.cpp
+extern volatile int32_t encoder_pulse_total;
 
-    struct SpeedFilterState {
-        float   buffer[SPEED_FILTER_MAX_WINDOW];
-        uint8_t windowLen;   // N thực tế đang dùng
-        uint8_t index;       // vị trí ghi tiếp theo
-        uint8_t count;       // số mẫu hợp lệ hiện có (<= windowLen)
-        float   sum;         // tổng các mẫu trong cửa sổ
-    };
+namespace Encoder
+{
+    // ===== Cấu hình & trạng thái nội bộ =====
 
-    static SpeedFilterState speedFilter;
+    // Giới hạn cửa sổ lọc
+    static constexpr uint8_t WIN_MIN = 1;
+    static constexpr uint8_t WIN_MAX = 32;
 
-    // Chuẩn hóa windowLen và reset trạng thái bộ lọc
-    static void resetFilterState(uint8_t windowLen)
+    // PPR của encoder
+    static uint16_t g_encoderPPR = 1;
+
+    // Bộ nhớ moving average cho tốc độ (rpm)
+    static float    g_speedBuf[WIN_MAX];
+    static uint8_t  g_winLen   = 1;      // N hiện tại
+    static uint8_t  g_index    = 0;      // vị trí ghi tiếp theo
+    static uint8_t  g_count    = 0;      // số mẫu hợp lệ hiện có
+    static float    g_sum      = 0.0f;   // tổng rpm trong cửa sổ
+
+    // Tổng count lần trước để tính delta
+    static int32_t  g_lastCount = 0;
+
+    // Tốc độ đã lọc
+    static float    g_speed_rpm_filt = 0.0f;
+
+    // ===== Hàm nội bộ =====
+
+    static void resetFilter(uint8_t N)
     {
-        if (windowLen < SPEED_FILTER_MIN_WINDOW) {
-            windowLen = SPEED_FILTER_MIN_WINDOW;
-        }
-        if (windowLen > SPEED_FILTER_MAX_WINDOW) {
-            windowLen = SPEED_FILTER_MAX_WINDOW;
-        }
+        if (N < WIN_MIN) N = WIN_MIN;
+        if (N > WIN_MAX) N = WIN_MAX;
 
-        speedFilter.windowLen = windowLen;
-        speedFilter.index     = 0;
-        speedFilter.count     = 0;
-        speedFilter.sum       = 0.0f;
+        g_winLen = N;
+        g_index  = 0;
+        g_count  = 0;
+        g_sum    = 0.0f;
 
-        for (uint8_t i = 0; i < SPEED_FILTER_MAX_WINDOW; ++i) {
-            speedFilter.buffer[i] = 0.0f;
-        }
+        for (uint8_t i = 0; i < WIN_MAX; ++i)
+            g_speedBuf[i] = 0.0f;
     }
 
-    void initSpeedFilter(uint8_t windowLen)
+    // Cập nhật moving average 1D cho rpm_raw
+    static float filter_update(float rpm_raw)
     {
-        resetFilterState(windowLen);
-    }
+        uint8_t N = g_winLen;
 
-    void setSpeedFilterWindow(uint8_t windowLen)
-    {
-        // Mỗi lần đổi N → reset để tránh sum bị lệch
-        resetFilterState(windowLen);
-    }
-
-    uint8_t getSpeedFilterWindow()
-    {
-        return speedFilter.windowLen;
-    }
-
-    float updateSpeedFilter(float rpm_sample)
-    {
-        uint8_t N = speedFilter.windowLen;
-
-        // Trường hợp N = 1: không lọc, trả về trực tiếp
-        if (N <= 1) {
-            speedFilter.buffer[0] = rpm_sample;
-            speedFilter.sum       = rpm_sample;
-            speedFilter.count     = 1;
-            speedFilter.index     = 0;
-            return rpm_sample;
+        // N = 1 => không lọc
+        if (N <= 1)
+        {
+            g_speedBuf[0]    = rpm_raw;
+            g_speed_rpm_filt = rpm_raw;
+            g_sum            = rpm_raw;
+            g_count          = 1;
+            g_index          = 0;
+            return rpm_raw;
         }
 
-        if (speedFilter.count < N) {
-            // Đang fill cửa sổ lần đầu
-            speedFilter.sum += rpm_sample;
-            speedFilter.buffer[speedFilter.index] = rpm_sample;
+        if (g_count < N)
+        {
+            // Giai đoạn fill cửa sổ
+            g_sum += rpm_raw;
+            g_speedBuf[g_index] = rpm_raw;
 
-            speedFilter.index++;
-            if (speedFilter.index >= N) {
-                speedFilter.index = 0;
-            }
+            g_index++;
+            if (g_index >= N)
+                g_index = 0;
 
-            speedFilter.count++;
-        } else {
-            // Đã đủ N mẫu: thay thế mẫu cũ nhất
-            float oldSample = speedFilter.buffer[speedFilter.index];
-            speedFilter.sum -= oldSample;
-            speedFilter.buffer[speedFilter.index] = rpm_sample;
-            speedFilter.sum += rpm_sample;
+            g_count++;
+        }
+        else
+        {
+            // Đã đủ N mẫu: bỏ mẫu cũ, thêm mẫu mới
+            float old = g_speedBuf[g_index];
+            g_sum -= old;
+            g_speedBuf[g_index] = rpm_raw;
+            g_sum += rpm_raw;
 
-            speedFilter.index++;
-            if (speedFilter.index >= N) {
-                speedFilter.index = 0;
-            }
+            g_index++;
+            if (g_index >= N)
+                g_index = 0;
         }
 
-        float denom = (speedFilter.count < N) ? static_cast<float>(speedFilter.count)
-                                            : static_cast<float>(N);
-
-        if (denom <= 0.0f) {
-            return rpm_sample;
+        float denom = (g_count < N) ? (float)g_count : (float)N;
+        if (denom <= 0.0f)
+        {
+            g_speed_rpm_filt = rpm_raw;
+            return rpm_raw;
         }
 
-        return speedFilter.sum / denom;
+        g_speed_rpm_filt = g_sum / denom;
+        return g_speed_rpm_filt;
     }
 
-} // namespace Actuator
+    // ===== API public =====
+
+    void speed_init(uint16_t encoderPPR)
+    {
+        if (encoderPPR == 0)
+            encoderPPR = 1;
+
+        g_encoderPPR    = encoderPPR;
+        g_lastCount     = 0;
+        g_speed_rpm_filt = 0.0f;
+
+        resetFilter(1);   // mặc định N = 1 (không lọc)
+    }
+
+    void speed_setFilterWindow(uint8_t N)
+    {
+        resetFilter(N);
+    }
+
+    uint8_t speed_getFilterWindow()
+    {
+        return g_winLen;
+    }
+
+    void speed_update_ms(uint32_t dt_ms)
+    {
+        if (dt_ms == 0)
+            return;
+
+        int32_t total_now;
+
+        // Đọc encoder_pulse_total an toàn
+        noInterrupts();
+        total_now = encoder_pulse_total;
+        interrupts();
+
+        int32_t delta = total_now - g_lastCount;
+        g_lastCount   = total_now;
+
+        // pulses/s
+        float pulses_per_s = (float)delta * (1000.0f / (float)dt_ms);
+        // rev/s
+        float rev_per_s    = pulses_per_s / (float)g_encoderPPR;
+        // rpm
+        float rpm_raw      = rev_per_s * 60.0f;
+        if (rpm_raw < 0.0f)
+            rpm_raw = 0.0f;
+
+        filter_update(rpm_raw);
+    }
+
+    float speed_get_rpm()
+    {
+        return g_speed_rpm_filt;
+    }
+}
