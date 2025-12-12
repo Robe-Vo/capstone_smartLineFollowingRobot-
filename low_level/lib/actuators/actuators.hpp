@@ -8,116 +8,20 @@
 #include <Arduino.h>
 #include <ESP32Servo.h>
 #include <stdint.h>
-class Actuators
-{
-public:
-    // ========= Driving motor =========
-    class Drive
-    {
-    private:
-        // Pin declaration
-        uint8_t MOTOR_OUT_1_PIN;
-        uint8_t MOTOR_OUT_2_PIN;
-        uint8_t MOTOR_PWM_PIN;
-        uint8_t ENCODER_CHANNEL_A;
-        uint8_t ENCODER_CHANNEL_B;
-
-        size_t        ENCODER_RESOLUTION;
-        unsigned long WAIT_RESPONSE_TIME;
-
-        // Flags
-        bool   available  = false;  // drive enable flag
-        bool   rotate_flag = false; // set true when encoder tick arrives
-        int8_t direction  = 0;      // 0: idle, 1: fwd, 2: rev
-
-        // Feedback
-        bool          encoder_calculation_flag = false; // true after first pulse
-        float         responded_speed = 0.0f;
-        unsigned long encoder_count   = 0;
-        unsigned long timer           = 0;  // last encoder pulse time [ms]
-
-        // Change direction according to "direction" state
-        void change_direction();
-
-        // Update direction based on input boolean (true = forward, false = backward)
-        void update_direction(bool dir_fwd);
-
-    public:
-        Drive(uint8_t MOTOR_OUT_1_PIN,
-              uint8_t MOTOR_OUT_2_PIN,
-              uint8_t MOTOR_PWM_PIN,
-              uint8_t ENCODER_CHANNEL_1,
-              uint8_t ENCODER_CHANNEL_2,
-              size_t  RESOLUTION,
-              unsigned long wait_time);
-
-        // Get
-        int8_t  get_directionStatus();
-        int16_t get_respondedSpeed();
-        bool    isRotating(unsigned long tmr);
-
-        // Update action state of motor
-        void enable();
-        void disable();
-        void brake();
-
-        // Motor action
-        bool driving(uint8_t speed, bool direction_fwd);
-
-        // Motor respond | Encoder
-        void Endcoder_channel_A_ISR();
-        void Endcoder_channel_B_ISR();
-    };
-
-    // ========= Steering motor =========
-    class Steer
-    {
-    private:
-        // Output pin
-        uint8_t STEERING_PIN;
-
-        // Angle range [deg]
-        uint16_t offset_angle = 0;
-        int      low_limit    = 55;   // min steering angle [deg]
-        int      high_limit   = 110;  // max steering angle [deg]
-
-        Servo servo;
-
-        int saturation(int angle_deg);
-
-    public:
-        Steer(uint8_t STEERING_PIN);
-
-        // Set angle in degrees (0..180)
-        void turn(int angle_deg);
-
-        // Disable servo
-        void disable();
-
-        // Enable servo
-        void enable();
-    };
-};
-
-
-
-
 namespace Encoder
 {
-    // Khởi tạo bộ tính tốc độ
-    //  - encoderPPR: số xung / vòng của encoder
-    void speed_init(uint16_t encoderPPR);
+    void init(uint16_t ppr,
+              uint16_t dt_speed_ms,
+              uint16_t accum_window_ms,
+              float    alpha);
 
-    // Cài đặt độ rộng cửa sổ moving-average N
-    //  N = 1  -> không lọc (trả về tốc độ thô)
-    //  1 <= N <= Nmax (giới hạn bên trong)
-    void speed_setFilterWindow(uint8_t N);
-    uint8_t speed_getFilterWindow();
+    void updateCount();      // ISR
+    void updateSpeed();      // gọi mỗi dt_speed_ms
+    float getRPM();
+}
 
-    // Gọi đều mỗi dt_ms (ví dụ 5 ms) để cập nhật tốc độ
-    //  - dt_ms: khoảng thời gian giữa 2 lần gọi, đơn vị ms
-    void speed_update_ms(uint32_t dt_ms);
-
-    // Lấy tốc độ đã lọc (rpm) cho PID / gửi PC
-    float speed_get_rpm();
+namespace Motor
+{
+    void init();
+    void setPWM(int pwm);
 }
