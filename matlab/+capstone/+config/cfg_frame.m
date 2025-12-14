@@ -1,51 +1,59 @@
-function frame = cfg_frame()
-    % cfg_frame
-    % Structure of ONE frame (1 tick)
-    % Used for logging, plotting, offline analysis
+function frame = cfg_frame(robot, road, frame_prev)
+    %CFG_FRAME Create a new frame struct (per rx/tx cycle).
+    % Inputs:
+    %   robot, road
+    %   frame_prev (optional): previous frame to reuse fields
+    % Output:
+    %   frame struct
+    
+    if nargin < 3
+        frame_prev = [];
+    end
     
     frame = struct();
     
-    % ===== TIME =====
-    frame.time.t        = 0;      % [s] time since start (toc)
-    frame.time.tickIdx  = 0;      % uint32 tick index
+    %% ===== Index / time =====
+    frame.k = NaN;
+    frame.t_host = NaN;
     
-    % ===== SENSOR RAW =====
-    frame.sensor.line.raw       = zeros(1,5);   % uint8 raw ADC (ESP32)
-    frame.sensor.ultra.raw      = 0;             % uint16 raw (mm)
-    frame.sensor.mpu.gyro       = zeros(1,3);    % int16
-    frame.sensor.mpu.accel      = zeros(1,3);    % int16
-    frame.sensor.encoder.count = 0;             % uint8 pulses this frame
+    %% ===== Active context =====
+    frame.road_id = road.id;
+    frame.mode = "IDLE"; % or "OPERATION"
     
-    % ===== SENSOR PROCESSED =====
-    frame.sensor.line.norm      = zeros(1,5);   % normalized [0..1]
-    frame.sensor.line.mask      = zeros(1,5);   % logic mask (0/1)
-    frame.sensor.line.error     = 0;             % signed error
-    frame.sensor.line.quality   = "UNKNOWN";     % OK / LOST / NOISE
+    %% ===== RX (robot -> host) =====
+    frame.rx = struct();
+    frame.rx.line_raw = zeros(1, robot.sense.line_n, robot.sense.line_dtype);
+    frame.rx.encoder_count = NaN;
+    frame.rx.encoder_delta = NaN;
+    frame.rx.speed_meas = NaN;           % optional (fill if firmware sends)
+    frame.rx.flags = struct('lineDetected',NaN,'commOk',NaN);
     
-    frame.sensor.encoder.total  = 0;             % uint32 accumulated in MATLAB
+    %% ===== PROC (host computed) =====
+    frame.proc = struct();
+    frame.proc.line_error = NaN;
+    frame.proc.line_mask = NaN;          % optional
+    frame.proc.road_switch = "";         % if switch happened this frame
     
-    % ===== ROAD / FSM STATE =====
-    frame.road.currentId        = 0;
-    frame.road.prevId           = 0;
-    frame.road.type             = "NONE";        % NORMAL / SPECIAL / STOP
-    frame.road.name             = "";
-    frame.road.lengthEnc        = 0;
-    frame.road.encFromEnter     = 0;
+    %% ===== TX (host -> robot) =====
+    frame.tx = struct();
+    frame.tx.cmd = uint8(0);             % set by your controller
+    frame.tx.drive_cmd = cast(0, robot.drive.cmd_dtype);   % 11-bit effective
+    frame.tx.steer_cmd = cast(0, robot.steer.cmd_dtype);
+    frame.tx.payload = uint8([]);        % optional raw bytes for logging
     
-    % ===== CONTROLLER STATE =====
-    frame.control.type          = "NONE";         % PID / ONOFF / STOP / SPECIAL
-    frame.control.tune          = struct();       % copy of tune used this frame
+    %% ===== DIAG =====
+    frame.diag = struct();
+    frame.diag.drop = false;
+    frame.diag.note = "";
     
-    % internal controller buffers 
-    frame.control.internal = struct( ...
-        "error",        0, ...
-        "errorInt",     0, ...
-        "errorDer",     0, ...
-        "lastError",    0 );
-    
-    % ===== COMMAND SENT TO ROBOT =====
-    frame.cmd.speed_u16         = uint16(0);
-    frame.cmd.steerDeg          = uint16(0);
-    frame.cmd.cmdByte           = uint8(0);
+    %% ===== Reuse policy =====
+    if ~isempty(frame_prev)
+        % Keep selected continuity signals
+        frame.k = frame_prev.k + 1;
+        frame.proc.prev_line_error = frame_prev.proc.line_error;
+    else
+        frame.k = 0;
+        frame.proc.prev_line_error = NaN;
+    end
 
 end
