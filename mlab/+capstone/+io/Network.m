@@ -88,48 +88,32 @@ classdef Network < handle
                 frame = [frame; b]; %#ok<AGROW>
             end
         end
-
-        function [ok, meas] = recvSensorFrame(obj, timeout)
-            % Frame fixed 22 bytes (the same as your old program)
-            % 1..5:  line uint8[5]
-            % 6..7:  ultrasonic uint16 (BE)
-            % 8..19: MPU int16[6] (BE)
-            % 20:    encCount uint8
-            % 21..22:encSpeed uint16 (BE), rpm*100
-
-            FRAME_LEN = 22;
-            if nargin < 2, timeout = 1.0; end
-
-            meas = struct("lineRaw",[],"ultra",[],"mpu",[],"encCount",[],"encSpeed",[]);
-            ok = false;
-
-            frame = obj.readFrameBlocking(FRAME_LEN, timeout);
-            if isempty(frame), return; end
-
-            meas.lineRaw = double(frame(1:5)).';
-
-            hiU = uint16(frame(6)); loU = uint16(frame(7));
-            meas.ultra = bitor(bitshift(hiU,8), loU);
-
-            mpuBytes = frame(8:19);
-            mpu = zeros(1,6);
-            for k = 1:6
-                hi = uint16(mpuBytes(2*k-1));
-                lo = uint16(mpuBytes(2*k));
-                v16 = bitor(bitshift(hi,8), lo);
-                mpu(k) = double(typecast(v16,'int16'));
+        
+        function sendControl(obj, speed_u16, angle_u16, cmd)
+            % OPERATION control frame 5B (LE):
+            % [cmd][spd_L][spd_H][ang_L][ang_H]
+            % speed_u16: 0..65535 (robot will scale to 11-bit internally)
+        
+            if nargin < 4
+                cmd = hex2dec('F1');
             end
-            meas.mpu = mpu;
-
-            meas.encCount = double(frame(20));
-
-            hiS = uint16(frame(21)); loS = uint16(frame(22));
-            spd_q = bitor(bitshift(hiS,8), loS);
-            meas.encSpeed = double(spd_q)/100.0;
-
-            ok = true;
+            if isempty(obj.conn)
+                return;
+            end
+        
+            spd = uint16(speed_u16);
+            ang = uint16(angle_u16);
+        
+            spd_L = uint8(bitand(spd, 255));
+            spd_H = uint8(bitshift(spd, -8));
+        
+            ang_L = uint8(bitand(ang, 255));
+            ang_H = uint8(bitshift(ang, -8));
+        
+            pkt = uint8([uint8(cmd); spd_L; spd_H; ang_L; ang_H]);
+            obj.sendByte(pkt);
         end
-
+        
         function ok = waitAck(obj, timeout)
             if nargin < 2, timeout = 1.0; end
             ok = false;
@@ -148,20 +132,6 @@ classdef Network < handle
                     return;
                 end
             end
-        end
-
-        function sendControl(obj, speed, angle, cmd)
-            if nargin < 4, cmd = hex2dec('F1'); end
-            if isempty(obj.conn), return; end
-
-            speed_u8 = uint8(speed);
-            angle_u16 = uint16(angle);
-
-            angle_hi = uint8(bitshift(angle_u16, -8));
-            angle_lo = uint8(bitand(angle_u16, 255));
-
-            pkt = uint8([uint8(cmd); speed_u8; angle_hi; angle_lo]);
-            obj.sendByte(pkt);
         end
 
         function disconnect(obj)

@@ -9,23 +9,5 @@ classdef Protocol
             proto.ACK           = uint8(hex2dec('20'));
             proto.SENSOR_FRAME_LEN = 22;
         end
-
-        function [lineNorm, mask] = normalizeLine(lineRaw, offset, scale, threshold)
-            r = double(lineRaw(:)).';
-            lineNorm = (r - offset).*scale;
-            lineNorm = max(0, min(1, lineNorm));
-            mask = lineNorm > threshold;
-        end
-
-        function e = computeError(lineNorm, mask, positions)
-            w = lineNorm;
-            w(~mask) = 0;
-            if all(w == 0)
-                e = 0;
-                return;
-            end
-            pos = sum(positions .* w) / sum(w);
-            e = -pos;
-        end
     end
 end
