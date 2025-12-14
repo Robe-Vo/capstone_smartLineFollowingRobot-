@@ -1,0 +1,112 @@
+1. Những gì bạn đã làm
+
+Thiết kế và chạy ổn định chương trình PID dò line đơn trạng thái
+
+Đọc frame cảm biến (line, ultrasonic, MPU, encoder) từ robot.
+
+Chuẩn hoá line sensor bằng dữ liệu white/black calibration.
+
+Tính sai số vị trí line bằng weighted average.
+
+Điều khiển servo bằng PID (Kp, Ki, Kd, anti-windup, deadband).
+
+Gửi lệnh điều khiển [cmd, speed, angle] về robot.
+
+Quản lý mode robot: IDLE ↔ OPERATION, ACK 0x20.
+
+Xây dựng Network class dùng được cho Bluetooth / UDP / TCP
+
+Kết nối, gửi byte, đọc byte non-blocking.
+
+Đọc frame sensor 22 byte theo giao thức cố định.
+
+Gửi frame điều khiển chuẩn hoá.
+
+Xác định rõ yêu cầu kiến trúc cho hệ thống lớn
+
+Điều khiển robot qua MATLAB App Designer.
+
+App chịu trách nhiệm kết nối, cấu hình, UI, plot, logging.
+
+Chương trình dò line phải ngắn gọn, không tự connect/config.
+
+Có thể chuyển PID ↔ ON/OFF ↔ controller khác trong tương lai.
+
+Hệ số điều khiển có thể:
+
+dùng toàn cục,
+
+theo từng đoạn đường,
+
+theo trạng thái bất thường (chưa ổn định, mất line, đoạn đặc biệt).
+
+2. Những gì bạn chưa làm (cần triển khai tiếp)
+
+Chưa có App Designer hoàn chỉnh điều khiển toàn hệ thống
+
+UI chọn controller (PID / ONOFF).
+
+UI chọn mode chạy (AUTO / MANUAL / STOP).
+
+UI chỉnh gain toàn cục / theo đoạn đường.
+
+UI force road state, manual speed/angle.
+
+Chưa tách PID cũ thành controller module độc lập
+
+PID vẫn gắn chặt vào loop cũ.
+
+Chưa có interface controller thống nhất cho các bộ điều khiển khác.
+
+Chưa có gain table + policy chọn gain
+
+Chưa phân biệt gain: GLOBAL / ROAD / UNSTABLE / LOST_LINE.
+
+Chưa có state machine rõ ràng cho road / condition
+
+Chưa có module phát hiện mất line, chưa ổn định, đoạn đặc biệt.
+
+Chưa có cơ chế App override state machine.
+
+Chưa có core loop độc lập hoàn toàn với App
+
+Loop mới chưa được tách thành executor thuần (rx → compute → tx).
+
+
+mlab/
+├─ app/
+│  └─ monitor.mlapp
+│     - Trung tâm điều khiển
+│     - Kết nối Network
+│     - Quản lý appState (flow + state machine)
+│     - Chọn controller, gain, mode
+│     - Plot + logging
+│
+├─ +capstone/
+│  ├─ +types/                % Định nghĩa STRUCT chuẩn
+│  │  ├─ makeCfgDefault.m    % Config tĩnh (robot, protocol, timing)
+│  │  ├─ makeAppStateDefault.m
+│  │  └─ makeRuntimeFrame.m
+│  │
+│  ├─ +io/                   % Giao tiếp thấp tầng
+│  │  ├─ Network.m           % (kế thừa từ class cũ)
+│  │  └─ Protocol.m          % Chuẩn hoá frame + tính error
+│  │
+│  ├─ +pipe/                 % Adapter I/O (core không biết protocol)
+│  │  ├─ rxSensorFrame.m
+│  │  └─ txControl.m
+│  │
+│  ├─ +control/              % Các bộ điều khiển (strategy)
+│  │  ├─ pidController.m
+│  │  ├─ onoffController.m
+│  │  └─ ControllerRegistry.m
+│  │
+│  ├─ +policy/               % Quy tắc chọn gain
+│  │  └─ selectGain.m
+│  │
+│  ├─ +logic/                % Phát hiện trạng thái
+│  │  ├─ detectLostLine.m
+│  │  └─ detectStability.m
+│  │
+│  └─ +data/
+│     └─ GainTable_default.m % Gain theo GLOBAL / UNSTABLE / LOST_LINE
