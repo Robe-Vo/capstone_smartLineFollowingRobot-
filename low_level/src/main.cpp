@@ -1,18 +1,25 @@
-// ======================= main.cpp =======================
+// ======================= main.cpp (QUICK PROTOTYPE, STRUCTURE LIKE OLD) =======================
+// Changes implemented per request:
+// 1) OPERATION receive frame: 1 byte cmd | 2 byte speed | 2 byte angle |
+//    - speed: uint16_t -> PWM 16-bit for DC motor
+//    - angle: uint16_t treated as DEG (55..105) for servo.write()
+// 2) Motor DC: PWM 16-bit via LEDC (replaces analogWrite)
+// 3) Encoder: add hybrid measurement (period + accumulate) with requested architecture
+//    - Encoder "resolution = 1": report speeds in Hz (pulses/s) directly
+// 4) Keep FreeRTOS tasks, flags, timer tick structure similar to provided code
+
 #include <Arduino.h>
 #include <ESP32Servo.h>
 #include "bluetooth.hpp"
 #include "sensors.hpp"
 #include "actuators.hpp"
+#include "esp_timer.h"
+#include "driver/gpio.h"
 
 /* ======================= CONFIG ======================= */
-#define TIME_SEND_SIGNAL   50   // ms, chu kỳ frame PC
 #define TIME_KICK_ULTRA    60   // ms
-
-#define TS_SPEED_MS        20   // ms, chu kỳ cập nhật tốc độ (lọc EMA/IIR)
-#define TS_POSITION_MS     200  // ms, chu kỳ vòng vị trí (chưa dùng PID)
-
-#define ENCODER_TIMEOUT_MS 200  // ms, quá lâu không có xung -> rpm = 0
+#define TS_SPEED_MS        20   // ms
+#define TS_POSITION_MS     200  // ms
 
 #define LINE_SENSOR_IDX_5_PIN 32
 #define LINE_SENSOR_IDX_4_PIN 35
@@ -27,45 +34,39 @@
 #define MOTOR_OUT_1_PIN 18
 #define MOTOR_OUT_2_PIN 19
 
-// Encoder: quadrature, dùng cả A/B, cả cạnh lên/xuống
 #define ENCODER_CHANNEL_A_PIN 33
 #define ENCODER_CHANNEL_B_PIN 25
-#define ENCODER_PPR           44   // pulses / rev đã nhân 4 cạnh
 
 #define SERVO_PIN 23
 
-#define DEBUG_ENCODER_ISR 0
+// PWM 16-bit
+#define PWM_FREQ_HZ 20000
+#define PWM_RES_BITS 16
+#define PWM_CH_MOTOR 0
 
-/* ======================= ENCODER GLOBAL STATE ======================= */
-// Tổng xung (dùng cho quãng đường + tính pulses/frame)
-volatile int32_t encoder_pulse_total  = 0;
-static  int32_t  encoder_pulse_total_prev = 0;
-static  int32_t  encoder_pulse_frame      = 0;
-
-// Quadrature state
-static volatile uint8_t enc_prev_state   = 0;
-static volatile int8_t  encoder_direction = +1;
-
-// Period measurement
-static volatile uint32_t enc_last_edge_us   = 0;   // thời điểm cạnh hợp lệ trước
-static volatile uint32_t enc_period_us      = 0;   // period mới nhất (us)
-static volatile uint32_t enc_last_pulse_ms  = 0;   // tick_1ms tại xung hợp lệ mới nhất
+// Servo degree limit (per request)
+#define SERVO_MIN_DEG 55
+#define SERVO_MAX_DEG 105
 
 /* ======================= SENSORS ======================= */
-uint8_t* line_signals = nullptr;
-uint16_t ultra_signal = 0;
-uint16_t mpu_signals[6] = {0};
+uint8_t*  line_signals  = nullptr;
+uint16_t  ultra_signal  = 0;
+uint16_t  mpu_signals[6]= {0};
 
-/* ======================= ACTUATORS (servo trong main) ======================= */
+/* ======================= ACTUATORS ======================= */
 Servo servo;
 
 /* ======================= COMMUNICATION ======================= */
 Network server(5946);
 
-static uint8_t  cmd         = 0x00;
-static uint8_t* payload     = nullptr;
-static uint8_t  speed       = 0;
-static uint16_t steer_angle = 75;
+/* OPERATION frame: 1B cmd | 2B speed | 2B angle |  => total 5 bytes */
+static inline uint16_t u16_le(const uint8_t* p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+/* ======================= STATE ======================= */
+static uint16_t speed_pwm16  = 0;   // 0..65535
+static uint16_t steer_angle  = 75;  // degree (55..105)
 
 /* ======================= FLAGS & TIMERS ======================= */
 static volatile bool     flag_read_line          = false;
@@ -78,17 +79,14 @@ static volatile bool     flag_disable_steer      = false;
 static volatile bool     flag_turn_steer         = false;
 static volatile bool     flag_op_stop_motor      = false;
 
-static volatile uint32_t tick_1ms                = 0;
-static volatile uint32_t tick_kickUltra          = 0;
+static volatile uint32_t tick_1ms       = 0;
+static volatile uint32_t tick_kickUltra = 0;
 
 static volatile bool speed_loop_tick    = false;
 static volatile bool position_loop_tick = false;
 
 /* Robot operation system */
-enum mode {
-    IDLE_MODE,
-    OPERATION_MODE
-};
+enum mode { IDLE_MODE, OPERATION_MODE };
 volatile mode robot_mode = IDLE_MODE;
 
 /* ======================= TIMER ======================= */
@@ -104,20 +102,27 @@ void IDLE_process(void *parameter);
 void OPERATION_process(void *parameter);
 void com_process(void *parameter);
 
-/* ======================= ENCODER ISRs ======================= */
-void IRAM_ATTR ISR_encoder_AB();
-
 /* ======================= HELPERS ======================= */
-void driveForward(uint8_t spd);
-void stopMotor();
-void setSteerAngle(uint16_t angle);
+static inline void stopMotor() {
+    MotorPWM16::stopMotor();
+}
+static inline void driveForward(uint16_t pwm16) {
+    MotorPWM16::driveForward(pwm16);
+}
+static inline void driveBackward(uint16_t pwm16) {
+    MotorPWM16::driveBackward(pwm16);
+}
+static inline void setSteerAngle_deg(uint16_t deg) {
+    if (deg < SERVO_MIN_DEG) deg = SERVO_MIN_DEG;
+    if (deg > SERVO_MAX_DEG) deg = SERVO_MAX_DEG;
+    if (!servo.attached()) servo.attach(SERVO_PIN);
+    servo.write((int)deg);
+}
 
 /* ======================= SETUP ======================= */
 void setup() {
     Serial.begin(115200);
-    delay(500);
-    Serial.println();
-    Serial.println("[SETUP] Booting...");
+    delay(300);
 
     // -------- Sensors --------
     line_setup(LINE_SENSOR_IDX_1_PIN,
@@ -129,39 +134,43 @@ void setup() {
     ultra_setup(ULTRASONIC_TRIG_PIN, ULTRASONIC_ECHO_PIN);
     attachInterrupt(ULTRASONIC_ECHO_PIN, hanlder_ultra_echo, CHANGE);
 
-    // -------- Actuators --------
-    pinMode(MOTOR_OUT_1_PIN, OUTPUT);
-    pinMode(MOTOR_OUT_2_PIN, OUTPUT);
-    pinMode(MOTOR_PWM_PIN,   OUTPUT);
+    // -------- Actuators: Motor PWM 16-bit --------
+    MotorPWM16::begin(MOTOR_PWM_PIN, MOTOR_OUT_1_PIN, MOTOR_OUT_2_PIN,
+                      PWM_CH_MOTOR, PWM_FREQ_HZ, PWM_RES_BITS);
 
+    // Servo
     servo.attach(SERVO_PIN);
-    servo.write(steer_angle);
+    setSteerAngle_deg(steer_angle);
     stopMotor();
 
-    // -------- Encoder (quadrature, cả A/B, cả cạnh) --------
-    pinMode(ENCODER_CHANNEL_A_PIN, INPUT_PULLUP);
-    pinMode(ENCODER_CHANNEL_B_PIN, INPUT_PULLUP);
-
-    uint8_t a0 = digitalRead(ENCODER_CHANNEL_A_PIN) ? 1 : 0;
-    uint8_t b0 = digitalRead(ENCODER_CHANNEL_B_PIN) ? 1 : 0;
-    enc_prev_state = (a0 << 1) | b0;
-
-    attachInterrupt(digitalPinToInterrupt(ENCODER_CHANNEL_A_PIN), ISR_encoder_AB, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(ENCODER_CHANNEL_B_PIN), ISR_encoder_AB, CHANGE);
-    Serial.println("[SETUP] Encoder quadrature interrupts attached");
-
-    // -------- Bộ lọc tốc độ (EMA + IIR bậc 2) --------
+    // -------- Encoder (hybrid) --------
     Encoder::speed_filter_init();
-    // Mặc định: mode = EMA bậc 1, alpha = 0.3, beta = 0.0
-    Encoder::speed_filter_config(0, 300, 0);
+
+    Encoder::HybridConfig hc;
+    hc.Tw_min_s = 0.005f;
+    hc.Tw_max_s = 0.007f;
+    hc.fLow_hz  = 40.0f;
+    hc.fHigh_hz = 80.0f;
+    hc.tau_iir_s = 0.050f;
+    hc.alpha_min = 0.05f;
+    hc.alpha_max = 0.30f;
+    hc.a_max_hz_per_s = 500.0f;
+    hc.k_zero = 3.0f;
+    hc.Tmin_zero_s = 0.035f;
+    hc.tau_zero_s  = 0.060f;
+    hc.f_dead_hz   = 1.0f;
+    hc.Tdead_s     = 0.060f;
+
+    // HARD clamp physical max (Hz). Set placeholder; adjust for your motor+encoder.
+    hc.f_hard_max_hz = 300.0f;
+
+    // "resolution = 1" per request (ppr_effective=1)
+    Encoder::encoder_begin(ENCODER_CHANNEL_A_PIN, ENCODER_CHANNEL_B_PIN, 1, hc);
 
     // -------- Network --------
-    Serial.println("[SETUP] Start to configurate network");
     while (!server.begin()) {
-        Serial.println("[SETUP] Configuration failed");
-        delay(1000);
+        delay(300);
     }
-    Serial.println("[SETUP] Network configured");
 
     // -------- Timer 1 ms --------
     Timer0_Cfg = timerBegin(0, 80, true);      // 80 MHz / 80 = 1 MHz
@@ -170,16 +179,15 @@ void setup() {
     timerAlarmEnable(Timer0_Cfg);
 
     robot_mode = IDLE_MODE;
-    Serial.println("[SETUP] Robot in IDLE_MODE");
 
     // -------- FreeRTOS Tasks --------
-    xTaskCreatePinnedToCore(com_process,      "com_process",      10000, NULL, 1, &COM_handle,      0);
-    xTaskCreatePinnedToCore(IDLE_process,     "IDLE_process",     10000, NULL, 1, &IDLE_handle,     1);
-    xTaskCreatePinnedToCore(OPERATION_process,"OPERATION_process",10000, NULL, 1, &OPERATION_handle,1);
+    xTaskCreatePinnedToCore(com_process,       "com_process",       4096, NULL, 3, &COM_handle,       0);
+    xTaskCreatePinnedToCore(IDLE_process,      "IDLE_process",      4096, NULL, 1, &IDLE_handle,      1);
+    xTaskCreatePinnedToCore(OPERATION_process, "OPERATION_process", 6144, NULL, 2, &OPERATION_handle, 1);
 }
 
 void loop() {
-    // dùng FreeRTOS, không code trong loop
+    // FreeRTOS only
 }
 
 /* ======================= TIMER ISR ======================= */
@@ -189,66 +197,13 @@ void IRAM_ATTR Timer0_ISR() {
     static uint16_t cnt_speed = 0;
     static uint16_t cnt_pos   = 0;
 
-    cnt_speed++;
-    if (cnt_speed >= TS_SPEED_MS) {
+    if (++cnt_speed >= TS_SPEED_MS) {
         cnt_speed = 0;
         speed_loop_tick = true;
     }
-
-    cnt_pos++;
-    if (cnt_pos >= TS_POSITION_MS) {
+    if (++cnt_pos >= TS_POSITION_MS) {
         cnt_pos = 0;
         position_loop_tick = true;
-    }
-}
-
-/* ======================= ENCODER ISR (quadrature + period) ======================= */
-void IRAM_ATTR ISR_encoder_AB() {
-    uint32_t now_us = micros();
-
-    uint8_t a = gpio_get_level((gpio_num_t)ENCODER_CHANNEL_A_PIN) ? 1 : 0;
-    uint8_t b = gpio_get_level((gpio_num_t)ENCODER_CHANNEL_B_PIN) ? 1 : 0;
-    uint8_t newState = (a << 1) | b;
-
-    // Bảng chuyển trạng thái quadrature 4x
-    // states: 00,01,11,10 = 0,1,3,2 (lưu ý Gray code)
-    static const int8_t quad_table[4][4] = {
-        // new:  0   1   2   3  (we use 0,1,2,3 indexing but state 2,3 mapping depends on wiring)
-        /*old=0*/ {  0, +1, -1,  0 },
-        /*old=1*/ { -1,  0,  0, +1 },
-        /*old=2*/ { +1,  0,  0, -1 },
-        /*old=3*/ {  0, -1, +1,  0 }
-    };
-
-    uint8_t oldState = enc_prev_state & 0x03;
-    int8_t step = quad_table[oldState][newState & 0x03];
-
-    enc_prev_state = newState;
-
-    if (step != 0) {
-        encoder_pulse_total  += step;
-        encoder_pulse_frame  += step;
-        encoder_direction     = (step > 0) ? +1 : -1;
-
-        uint32_t dt = now_us - enc_last_edge_us;
-        enc_last_edge_us = now_us;
-
-        // bỏ glitch quá nhanh (dt quá nhỏ)
-        if (dt > 50) {
-            enc_period_us     = dt;
-            enc_last_pulse_ms = tick_1ms;
-        }
-
-#if DEBUG_ENCODER_ISR
-        static uint32_t lastPrint = 0;
-        if (now_us - lastPrint > 10000) {
-            ets_printf("[ENC] tot=%d frame=%d step=%d\n",
-                       (int)encoder_pulse_total,
-                       (int)encoder_pulse_frame,
-                       (int)step);
-            lastPrint = now_us;
-        }
-#endif
     }
 }
 
@@ -256,220 +211,142 @@ void IRAM_ATTR ISR_encoder_AB() {
 void com_process(void *parameter) {
     (void)parameter;
 
+    static int32_t encoder_total_prev = 0;
+
     for (;;) {
-        switch (robot_mode) {
-        case IDLE_MODE: {
+        if (robot_mode == IDLE_MODE) {
             uint8_t c;
             if (server.getUint8(c)) {
                 bool ok = true;
 
                 switch (c) {
-                case 0xFF: // IDLE -> OPERATION
-                    robot_mode = OPERATION_MODE;
-                    Serial.println("[MODE] Switch to OPERATION_MODE");
-                    break;
+                    case 0xFF:
+                        robot_mode = OPERATION_MODE;
+                        break;
+                    case 0xFE:
+                        robot_mode = IDLE_MODE;
+                        break;
 
-                case 0xFE: // stay in IDLE
-                    robot_mode = IDLE_MODE;
-                    Serial.println("[MODE] Stay in IDLE_MODE");
-                    break;
+                    case 0xEF: flag_read_line  = true; break;
+                    case 0xEE: flag_read_ultra = true; break;
+                    case 0xED: flag_read_mpu   = true; break;
 
-                /* -------- Sensor commands -------- */
-                case 0xEF:
-                    flag_read_line = true;
-                    break;
+                    case 0xDF: {
+                        // old: 1 byte speed -> now map into 16-bit (quick compat)
+                        uint8_t spd8;
+                        if (server.getUint8(spd8)) {
+                            speed_pwm16 = (uint16_t)spd8 * 257u; // 0..255 -> 0..65535
+                            flag_run_drive_forward = true;
+                        } else ok = false;
+                    } break;
 
-                case 0xEE:
-                    flag_read_ultra = true;
-                    break;
+                    case 0xDE: {
+                        uint8_t spd8;
+                        if (server.getUint8(spd8)) {
+                            speed_pwm16 = (uint16_t)spd8 * 257u;
+                            flag_run_drive_backward = true;
+                        } else ok = false;
+                    } break;
 
-                case 0xED:
-                    flag_read_mpu = true;
-                    break;
+                    case 0xDD:
+                        flag_run_drive_stop = true;
+                        break;
 
-                /* -------- Drive / Servo commands -------- */
-                // [0xDF] [speed]
-                case 0xDF: {
-                    uint8_t spd;
-                    if (server.getUint8(spd)) {
-                        speed = spd;
-                        flag_run_drive_forward = true;
-                        Serial.print("[IDLE CMD] FWD speed=");
-                        Serial.println(speed);
-                    } else ok = false;
-                    break;
+                    case 0xDC:
+                        flag_disable_steer = true;
+                        break;
+
+                    case 0xDB: {
+                        uint8_t hi, lo;
+                        if (server.getUint8(hi) && server.getUint8(lo)) {
+                            steer_angle = (uint16_t(hi) << 8) | uint16_t(lo);
+                            flag_turn_steer = true;
+                        } else ok = false;
+                    } break;
+
+                    case 0xEC: {
+                        // keep old filter config command; still accepted
+                        uint8_t mode;
+                        uint8_t a_hi, a_lo, b_hi, b_lo;
+                        if (server.getUint8(mode) &&
+                            server.getUint8(a_hi) && server.getUint8(a_lo) &&
+                            server.getUint8(b_hi) && server.getUint8(b_lo)) {
+                            uint16_t a_raw = (uint16_t(a_hi) << 8) | uint16_t(a_lo);
+                            uint16_t b_raw = (uint16_t(b_hi) << 8) | uint16_t(b_lo);
+                            Encoder::speed_filter_config(mode, a_raw, b_raw);
+                        } else ok = false;
+                    } break;
+
+                    case 0xA0: {
+                        server.transmitUint8(0xA1);
+                        ok = false; // no ACK
+                    } break;
+
+                    default:
+                        break;
                 }
 
-                // [0xDE] [speed]
-                case 0xDE: {
-                    uint8_t spd;
-                    if (server.getUint8(spd)) {
-                        speed = spd;
-                        flag_run_drive_backward = true;
-                        Serial.print("[IDLE CMD] REV speed=");
-                        Serial.println(speed);
-                    } else ok = false;
-                    break;
-                }
-
-                case 0xDD:
-                    flag_run_drive_stop = true;
-                    Serial.println("[IDLE CMD] STOP");
-                    break;
-
-                case 0xDC:
-                    flag_disable_steer = true;
-                    break;
-
-                // [0xDB] [angle_hi] [angle_lo]
-                case 0xDB: {
-                    uint8_t hi, lo;
-                    if (server.getUint8(hi) && server.getUint8(lo)) {
-                        steer_angle = (uint16_t(hi) << 8) | uint16_t(lo);
-                        flag_turn_steer = true;
-                        Serial.print("[IDLE CMD] STEER=");
-                        Serial.println(steer_angle);
-                    } else ok = false;
-                    break;
-                }
-
-                // [0xEC] [m] [a_hi] [a_lo] [b_hi] [b_lo]
-                // m = 0: EMA bậc 1, alpha = a; m = 1: IIR bậc 2 (cascade), alpha=a, beta=b
-                // a_raw,b_raw: uint16, scale 1/1000 (0..1000 -> 0..1.000)
-                case 0xEC: {
-                    uint8_t mode;
-                    uint8_t a_hi, a_lo, b_hi, b_lo;
-                    if (server.getUint8(mode) &&
-                        server.getUint8(a_hi) && server.getUint8(a_lo) &&
-                        server.getUint8(b_hi) && server.getUint8(b_lo)) {
-
-                        uint16_t a_raw = (uint16_t(a_hi) << 8) | uint16_t(a_lo);
-                        uint16_t b_raw = (uint16_t(b_hi) << 8) | uint16_t(b_lo);
-                        Encoder::speed_filter_config(mode, a_raw, b_raw);
-
-                        Serial.print("[IDLE CMD] ENC filter mode=");
-                        Serial.print(mode);
-                        Serial.print(" a_raw=");
-                        Serial.print(a_raw);
-                        Serial.print(" b_raw=");
-                        Serial.println(b_raw);
-                    } else {
-                        ok = false;
-                    }
-                    break;
-                }
-
-                // Ping
-                case 0xA0: {
-                    uint32_t t_rx = micros();
-                    server.transmitUint8(0xA1);
-                    uint32_t t_tx = micros();
-                    Serial.print("[PING] dt_us = ");
-                    Serial.println(t_tx - t_rx);
-                    ok = false; // không trả ACK 0x20
-                    break;
-                }
-
-                default:
-                    break;
-                }
-
-                if (ok) {
-                    server.transmitUint8(0x20); // ACK
-                }
+                if (ok) server.transmitUint8(0x20);
             }
-            break;
         }
+        else if (robot_mode == OPERATION_MODE) {
+            // NEW: Operation frame 5 bytes: cmd | speed(u16) | angle(u16)
+            uint8_t ctrl[5];
+            if (server.getArrayUint8(ctrl, 5)) {
+                uint8_t  c   = ctrl[0];
+                uint16_t spd = u16_le(&ctrl[1]);   // PWM 16-bit
+                uint16_t ang = u16_le(&ctrl[3]);   // degree 55..105 (expected)
 
-        case OPERATION_MODE: {
-            // MATLAB gửi 4 byte control [cmd, speed, angle_hi, angle_lo]
-            uint8_t ctrl[4];
-            if (server.getArrayUint8(ctrl, 4)) {
-                uint8_t c    = ctrl[0];
-                uint8_t spd  = ctrl[1];
-                uint16_t ang = (uint16_t(ctrl[2]) << 8) | uint16_t(ctrl[3]);
-
-                switch (c) {
-                case 0xF0: // STOP
-                    speed = 0;
+                if (c == 0xF0) {
+                    speed_pwm16 = 0;
                     flag_op_stop_motor = true;
-                    Serial.println("[OPE CMD] STOP");
-                    break;
-
-                case 0xF1: // forward + steering
-                    speed       = spd;
+                } else if (c == 0xF1) {
+                    speed_pwm16 = spd;
                     steer_angle = ang;
-                    Serial.print("[OPE CMD] FWD speed=");
-                    Serial.print(speed);
-                    Serial.print(" angle=");
-                    Serial.println(steer_angle);
-                    break;
-
-                case 0xFE: // back to IDLE
+                } else if (c == 0xFE) {
                     robot_mode = IDLE_MODE;
                     server.transmitUint8(0x20);
                     stopMotor();
-                    Serial.println("[MODE] Back to IDLE_MODE from OPERATION");
-                    break;
-
-                default:
-                    break;
                 }
 
-                // Pulses per frame: dựa trên encoder_pulse_total
-                int32_t total_now;
-                noInterrupts();
-                total_now = encoder_pulse_total;
-                interrupts();
+                // Atomic snapshot for pulses/frame (same pattern)
+                int32_t total_now = Encoder::encoder_get_total();
+                int32_t delta = total_now - encoder_total_prev;
+                encoder_total_prev = total_now;
 
-                int32_t delta = total_now - encoder_pulse_total_prev;
-                encoder_pulse_total_prev = total_now;
-                encoder_pulse_frame      = delta;
+                int32_t pulses_mag = delta;
+                if (pulses_mag < 0) pulses_mag = -pulses_mag;
+                if (pulses_mag > 255) pulses_mag = 255;
 
-                int32_t pulses = encoder_pulse_frame;
-
-                // Đọc line + ultrasonic
+                // Read sensors
                 line_signals = line_readSignals();
                 ultra_signal = ultra_getSignal();
 
-                // Lấy tốc độ đã lọc (EMA/IIR)
-                float rpm_filt = Encoder::speed_get_rpm();
+                // Send speed as uint16 (Hz, from hybrid output magnitude)
+                float f_out = Encoder::speed_get_hz_out();
+                if (f_out < 0.0f) f_out = -f_out;
+                if (f_out > 65535.0f) f_out = 65535.0f;
+                uint16_t spd_q = (uint16_t)f_out;
 
-                // Build frame 22 byte
+                // Frame 22 bytes (keep same length for MATLAB parser)
                 const uint8_t FRAME_LEN = 22;
                 uint8_t frame[FRAME_LEN] = {0};
 
-                // line sensors
-                for (int i = 0; i < 5; ++i) {
-                    frame[i] = line_signals ? line_signals[i] : 0;
-                }
+                for (int i = 0; i < 5; ++i) frame[i] = line_signals ? line_signals[i] : 0;
 
-                // ultrasonic
                 frame[5] = (uint8_t)(ultra_signal >> 8);
                 frame[6] = (uint8_t)(ultra_signal & 0xFF);
 
-                // pulses per frame (clamp 0..255 magnitude)
-                if (pulses < 0)   pulses = -pulses;   // nếu cần magnitude
-                if (pulses > 255) pulses = 255;
-                frame[19] = (uint8_t)pulses;
-
-                // speed (rpm) đã lọc, uint16 big-endian
-                if (rpm_filt < 0.0f)      rpm_filt = -rpm_filt; // gửi magnitude, nếu cần dấu thì mở rộng frame
-                if (rpm_filt > 65535.0f)  rpm_filt = 65535.0f;
-                uint16_t spd_q = (uint16_t)rpm_filt;
+                // Keep old fields at end: pulses_mag + speed_u16
+                frame[19] = (uint8_t)pulses_mag;
                 frame[20] = (uint8_t)(spd_q >> 8);
                 frame[21] = (uint8_t)(spd_q & 0xFF);
 
                 server.transmitArrayUint8(frame, FRAME_LEN);
             }
-            break;
         }
 
-        default:
-            break;
-        }
-
-        vTaskDelay(1 / portTICK_PERIOD_MS);
+        vTaskDelay(1);
     }
 }
 
@@ -482,17 +359,17 @@ void IDLE_process(void *parameter) {
             if (flag_read_line) {
                 flag_read_line = false;
                 line_signals = line_readSignals();
-                if (line_signals != nullptr) {
-                    server.transmitArrayUint8(line_signals, 5);
-                }
+                if (line_signals) server.transmitArrayUint8(line_signals, 5);
             }
 
             if (flag_read_ultra) {
                 flag_read_ultra = false;
+
+                ultra_kick();
+                delayMicroseconds(200);
+
                 ultra_signal = ultra_getSignal();
-                uint8_t buf[2];
-                buf[0] = (uint8_t)(ultra_signal >> 8);
-                buf[1] = (uint8_t)(ultra_signal & 0xFF);
+                uint8_t buf[2] = {(uint8_t)(ultra_signal >> 8), (uint8_t)(ultra_signal & 0xFF)};
                 server.transmitArrayUint8(buf, 2);
             }
 
@@ -500,22 +377,20 @@ void IDLE_process(void *parameter) {
                 flag_read_mpu = false;
                 uint8_t buf[12];
                 for (int i = 0; i < 6; ++i) {
-                    buf[2 * i]     = (uint8_t)(mpu_signals[i] >> 8);
-                    buf[2 * i + 1] = (uint8_t)(mpu_signals[i] & 0xFF);
+                    buf[2*i]   = (uint8_t)(mpu_signals[i] >> 8);
+                    buf[2*i+1] = (uint8_t)(mpu_signals[i] & 0xFF);
                 }
                 server.transmitArrayUint8(buf, 12);
             }
 
             if (flag_run_drive_forward) {
                 flag_run_drive_forward = false;
-                driveForward(speed);
+                driveForward(speed_pwm16);
             }
 
             if (flag_run_drive_backward) {
                 flag_run_drive_backward = false;
-                digitalWrite(MOTOR_OUT_1_PIN, LOW);
-                digitalWrite(MOTOR_OUT_2_PIN, HIGH);
-                analogWrite(MOTOR_PWM_PIN, speed);
+                driveBackward(speed_pwm16);
             }
 
             if (flag_run_drive_stop) {
@@ -530,11 +405,11 @@ void IDLE_process(void *parameter) {
 
             if (flag_turn_steer) {
                 flag_turn_steer = false;
-                setSteerAngle(steer_angle);
+                setSteerAngle_deg(steer_angle);
             }
         }
 
-        vTaskDelay(1 / portTICK_PERIOD_MS);
+        vTaskDelay(1);
     }
 }
 
@@ -542,79 +417,45 @@ void IDLE_process(void *parameter) {
 void OPERATION_process(void *parameter) {
     (void)parameter;
 
-    speed       = 0;
-    steer_angle = 95;
+    speed_pwm16  = 0;
+    steer_angle  = 95;
+
     if (!servo.attached()) servo.attach(SERVO_PIN);
-    servo.write(steer_angle);
+    setSteerAngle_deg(steer_angle);
+
+    uint32_t last_speed_ms = tick_1ms;
 
     for (;;) {
         if (robot_mode == OPERATION_MODE) {
             // Kick ultrasonic
-            if ((tick_1ms - tick_kickUltra) >= TIME_KICK_ULTRA) {
+            uint32_t now_ms = tick_1ms;
+            if ((now_ms - tick_kickUltra) >= TIME_KICK_ULTRA) {
                 ultra_kick();
-                tick_kickUltra = tick_1ms;
+                tick_kickUltra = now_ms;
             }
 
-            // Cập nhật tốc độ thô và lọc EMA/IIR
+            // Hybrid measurement update at TS_SPEED_MS (same tick as old speed loop)
             if (speed_loop_tick) {
                 speed_loop_tick = false;
 
-                uint32_t now_ms = tick_1ms;
-                uint32_t T_us;
-                uint32_t last_ms;
-                int8_t   dir;
+                // dt_s based on scheduler
+                uint32_t now2 = tick_1ms;
+                float dt_s = (now2 - last_speed_ms) * 1e-3f;
+                if (dt_s <= 0.0f) dt_s = TS_SPEED_MS * 1e-3f;
+                last_speed_ms = now2;
 
-                noInterrupts();
-                T_us    = enc_period_us;
-                last_ms = enc_last_pulse_ms;
-                dir     = encoder_direction;
-                interrupts();
-
-                float rpm_raw = 0.0f;
-
-                if (T_us > 0 && (now_ms - last_ms) <= ENCODER_TIMEOUT_MS) {
-                    float pulses_per_rev = (float)ENCODER_PPR;
-                    float rev_per_sec    = 1.0e6f / (pulses_per_rev * (float)T_us);
-                    rpm_raw              = (dir >= 0 ? 1.0f : -1.0f) * 60.0f * rev_per_sec;
-                } else {
-                    rpm_raw = 0.0f;
-                }
-
-                Encoder::speed_filter_update(rpm_raw);
+                Encoder::hybrid_update(dt_s, now2);
             }
-
-            // Vòng vị trí sẽ thêm sau (position_loop_tick)
 
             if (flag_op_stop_motor) {
                 stopMotor();
                 flag_op_stop_motor = false;
             } else {
-                digitalWrite(MOTOR_OUT_1_PIN, HIGH);
-                digitalWrite(MOTOR_OUT_2_PIN, LOW);
-                analogWrite(MOTOR_PWM_PIN, speed);
-                setSteerAngle(steer_angle);
+                driveForward(speed_pwm16);
+                setSteerAngle_deg(steer_angle);
             }
         }
 
-        vTaskDelay(1 / portTICK_PERIOD_MS);
+        vTaskDelay(1);
     }
-}
-
-/* ======================= HELPERS ======================= */
-void driveForward(uint8_t spd) {
-    digitalWrite(MOTOR_OUT_1_PIN, HIGH);
-    digitalWrite(MOTOR_OUT_2_PIN, LOW);
-    analogWrite(MOTOR_PWM_PIN, spd);
-}
-
-void stopMotor() {
-    analogWrite(MOTOR_PWM_PIN, 0);
-    digitalWrite(MOTOR_OUT_1_PIN, LOW);
-    digitalWrite(MOTOR_OUT_2_PIN, LOW);
-}
-
-void setSteerAngle(uint16_t angle) {
-    if (angle > 180) angle = 180;
-    if (!servo.attached()) servo.attach(SERVO_PIN);
-    servo.write(angle);
 }
