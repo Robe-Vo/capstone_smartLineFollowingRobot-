@@ -1,528 +1,379 @@
 function roads = cfg_roads(robot)
-    %CFG_ROADS Create road structs with unified geometry fields for all segments.
-    %
-    % - Unified geometry struct is used for LINE / ARC / JUNCTION segments.
-    % - Params that do not apply are set to NaN (or 0 where appropriate).
-    % - All non-tuning constants / map construction math are grouped at the end
-    %   of this file in local helper functions, to keep tuning clean.
-    
-    %% ===== 0) Build map primitives (from map.m logic; no numeric hardcode here) =====
-    M = local_buildMapPrimitives();
-    
-    %% ===== 1) Compute derived geometry for continuity (Arc5, Arc8) + endpoints =====
-    G = local_computeDerivedGeometry(M);
-    
-    %% ===== 2) Allocate road array =====
-    roads = repmat(struct(), 1, 9);
-    
-    %% ===== 3) Templates =====
-    geom0    = local_geomTemplate();                % unified geometry
-    profile0 = local_profileTemplate(robot);        % placeholder (you fill later)
-    ctrl0    = local_controlTemplate();             % placeholder tuning (you fill later)
-    sw0      = local_switchTemplate();              % placeholder switching logic
-    
-    %% ===== 4) Road 1: Line1 =====
+%CFG_ROADS  Define all road segments + full tuning blocks (edit here)
+% Usage:
+%   robot = capstone.config.cfg_robot();
+%   roads = capstone.config.cfg_roads(robot);
+
+    roads = repmat(cfg_oneRoad(robot), 1, 11); % 9 map segments + END + AVOID
+
+    %% =====================================================================
+    %  [1] L1 (LINE)
+    %% =====================================================================
     i = 1;
-    roads(i).id     = "1_LINE1";
-    roads(i).type   = "LINE";
-    roads(i).branch = "MAIN";
-    roads(i).geometry = geom0;
-    roads(i).geometry.kind = "LINE";
-    
-    roads(i).geometry.p_s = G.p1_s;
-    roads(i).geometry.p_e = G.p1_e;
-    
-    % LINE-only fields (keep unified struct; others remain NaN)
-    roads(i).geometry.len_mm = norm(roads(i).geometry.p_e - roads(i).geometry.p_s);
-    roads(i).geometry.tan_s  = local_unit(roads(i).geometry.p_e - roads(i).geometry.p_s);
-    roads(i).geometry.tan_e  = roads(i).geometry.tan_s;
-    roads(i).geometry.nor_s  = local_rot90(roads(i).geometry.tan_s);
-    roads(i).geometry.nor_e  = roads(i).geometry.nor_s;
-    
-    roads(i).profile = profile0;
-    roads(i).control = ctrl0;
-    roads(i).switch  = sw0;
-    roads(i).switch.next = "2_ARC2";
-    
-    %% ===== 5) Road 2: Arc2 =====
+    roads(i).id   = "L1";
+    roads(i).type = "LINE";
+
+    roads(i).geom.start_xy_mm  = [   0.00    0.00];
+    roads(i).geom.end_xy_mm    = [-2500.00   0.00];
+    roads(i).geom.center_xy_mm = [NaN NaN];
+    roads(i).geom.R_mm         = NaN;
+
+    roads(i).switch.entry_condition = "START_RUN";
+    roads(i).switch.exit_condition  = "ENC_REACH_SEG_END";
+    roads(i).switch.fallback        = "LOSTLINE->BLIND";
+    roads(i).switch.next_id_default = "A2";
+    roads(i).switch.branch_ids      = strings(1,0);
+
+    % Drive: constant speed mode (11-bit)
+    roads(i).tune.drive.mode          = "CONST_SPEED";
+    roads(i).tune.drive.const_cmd_u11 = uint16(800);     % EDIT: 0..2047
+    roads(i).tune.drive.pid_speed.Kp  = NaN;
+    roads(i).tune.drive.pid_speed.Ki  = NaN;
+    roads(i).tune.drive.pid_speed.Kd  = NaN;
+    roads(i).tune.drive.pid_speed.u_min = 0;
+    roads(i).tune.drive.pid_speed.u_max = double(robot.limits.drive.cmd_max);
+    roads(i).tune.drive.pid_speed.aw_enable = true;
+    roads(i).tune.drive.pid_speed.aw_gain   = NaN;
+
+    % Steering: PID + milestones
+    roads(i).tune.steer.mode = "PID_MILESTONE";
+    roads(i).tune.steer.pid.Kp = NaN;
+    roads(i).tune.steer.pid.Ki = NaN;
+    roads(i).tune.steer.pid.Kd = NaN;
+    roads(i).tune.steer.pid.deadband_err = NaN;         % in error-unit
+    roads(i).tune.steer.pid.I_min = NaN;                % integrator clamp
+    roads(i).tune.steer.pid.I_max = NaN;
+    roads(i).tune.steer.pid.dLim_deg_per_s = NaN;       % optional slew rate
+    roads(i).tune.steer.pid.milestones_deg = [robot.hw.steer.center_deg]; % EDIT: [80 78 80 ...]
+    roads(i).tune.steer.pid.overshoot_guard.enable = true;
+    roads(i).tune.steer.pid.overshoot_guard.next_guard_deg = NaN; % optional
+
+    % ONOFF placeholders
+    roads(i).tune.steer.onoff.th_on = NaN;
+    roads(i).tune.steer.onoff.th_off = NaN;
+    roads(i).tune.steer.onoff.cmd_left_deg = NaN;
+    roads(i).tune.steer.onoff.cmd_right_deg = NaN;
+
+    % Motion placeholders (unused in CONST_SPEED but kept for consistency)
+    roads(i).motion.encoder_count_seg = NaN;
+    roads(i).motion.v0_prev_end       = NaN;
+    roads(i).motion.vmax              = NaN;
+    roads(i).motion.vmin              = NaN;
+    roads(i).motion.t_finish          = NaN;
+    roads(i).motion.profile.valid     = false;
+    roads(i).motion.profile.type      = "TRAPEZOID";
+    roads(i).motion.profile.data      = [];
+
+
+    %% =====================================================================
+    %  [2] A2 (ARC, R=500)
+    %% =====================================================================
     i = 2;
-    roads(i).id     = "2_ARC2";
-    roads(i).type   = "ARC";
-    roads(i).branch = "MAIN";
-    roads(i).geometry = geom0;
-    roads(i).geometry.kind = "ARC";
-    
-    roads(i).geometry.cen   = G.c2_cen;
-    roads(i).geometry.r_mm  = G.c2_r;
-    roads(i).geometry.th_s  = G.c2_s;
-    roads(i).geometry.th_e  = G.c2_e;
-    roads(i).geometry.dir   = local_arcDir(G.c2_s, G.c2_e); % +1 ccw / -1 cw heuristic
-    
-    roads(i).geometry.p_s   = G.p2_s;
-    roads(i).geometry.p_e   = G.p2_e;
-    roads(i).geometry.len_mm = abs(G.c2_r) * abs(G.c2_e - G.c2_s);
-    
-    roads(i).geometry.tan_s = local_arcTangent(G.c2_s, roads(i).geometry.dir);
-    roads(i).geometry.tan_e = local_arcTangent(G.c2_e, roads(i).geometry.dir);
-    roads(i).geometry.nor_s = local_rot90(roads(i).geometry.tan_s);
-    roads(i).geometry.nor_e = local_rot90(roads(i).geometry.tan_e);
-    
-    roads(i).profile = profile0;
-    roads(i).control = ctrl0;
-    roads(i).switch  = sw0;
-    roads(i).switch.next = "3_LINE3";
-    
-    %% ===== 6) Road 3: Line3 (ends at junction) =====
+    roads(i).id   = "A2";
+    roads(i).type = "ARC";
+
+    roads(i).geom.start_xy_mm  = [-2500.00     0.00];
+    roads(i).geom.end_xy_mm    = [-2500.00  1000.00];
+    roads(i).geom.center_xy_mm = [-2500.00   500.00];
+    roads(i).geom.R_mm         = 500.00;
+
+    roads(i).switch.entry_condition = "FROM:L1";
+    roads(i).switch.exit_condition  = "ENC_REACH_SEG_END";
+    roads(i).switch.fallback        = "LOSTLINE->BLIND";
+    roads(i).switch.next_id_default = "L3";
+    roads(i).switch.branch_ids      = strings(1,0);
+
+    roads(i).tune.drive.mode          = "CONST_SPEED";
+    roads(i).tune.drive.const_cmd_u11 = uint16(700);     % EDIT
+    roads(i).tune.drive.pid_speed.Kp  = NaN; roads(i).tune.drive.pid_speed.Ki = NaN; roads(i).tune.drive.pid_speed.Kd = NaN;
+
+    roads(i).tune.steer.mode = "PID_MILESTONE";
+    roads(i).tune.steer.pid.Kp = NaN; roads(i).tune.steer.pid.Ki = NaN; roads(i).tune.steer.pid.Kd = NaN;
+    roads(i).tune.steer.pid.deadband_err = NaN;
+    roads(i).tune.steer.pid.I_min = NaN; roads(i).tune.steer.pid.I_max = NaN;
+    roads(i).tune.steer.pid.dLim_deg_per_s = NaN;
+    roads(i).tune.steer.pid.milestones_deg = [robot.hw.steer.center_deg]; % EDIT
+
+
+    %% =====================================================================
+    %  [3] L3 (LINE)
+    %% =====================================================================
     i = 3;
-    roads(i).id     = "3_LINE3";
-    roads(i).type   = "LINE";
-    roads(i).branch = "MAIN";
-    roads(i).geometry = geom0;
-    roads(i).geometry.kind = "LINE";
-    
-    roads(i).geometry.p_s = G.p3_s;
-    roads(i).geometry.p_e = G.p3_e; % junction point pJ
-    
-    roads(i).geometry.len_mm = norm(roads(i).geometry.p_e - roads(i).geometry.p_s);
-    roads(i).geometry.tan_s  = local_unit(roads(i).geometry.p_e - roads(i).geometry.p_s);
-    roads(i).geometry.tan_e  = roads(i).geometry.tan_s;
-    roads(i).geometry.nor_s  = local_rot90(roads(i).geometry.tan_s);
-    roads(i).geometry.nor_e  = roads(i).geometry.nor_s;
-    
-    roads(i).profile = profile0;
-    roads(i).control = ctrl0;
-    roads(i).switch  = sw0;
-    roads(i).switch.nextA  = "4_ARC4";
-    roads(i).switch.nextB  = "7_ARC7";
-    roads(i).switch.policy = "preselected"; % TODO
-    
-    %% ===== 7) Road 4: Arc4 (branch A) =====
+    roads(i).id   = "L3";
+    roads(i).type = "LINE";
+
+    roads(i).geom.start_xy_mm  = [-2500.00 1000.00];
+    roads(i).geom.end_xy_mm    = [-2331.37 1000.00];
+
+    roads(i).switch.entry_condition = "FROM:A2";
+    roads(i).switch.exit_condition  = "ENC_REACH_SEG_END";
+    roads(i).switch.fallback        = "LOSTLINE->BLIND";
+    roads(i).switch.next_id_default = "A4";
+
+    roads(i).tune.drive.mode          = "CONST_SPEED";
+    roads(i).tune.drive.const_cmd_u11 = uint16(750);     % EDIT
+
+    roads(i).tune.steer.mode = "PID_MILESTONE";
+    roads(i).tune.steer.pid.Kp = NaN; roads(i).tune.steer.pid.Ki = NaN; roads(i).tune.steer.pid.Kd = NaN;
+    roads(i).tune.steer.pid.deadband_err = NaN;
+    roads(i).tune.steer.pid.I_min = NaN; roads(i).tune.steer.pid.I_max = NaN;
+    roads(i).tune.steer.pid.dLim_deg_per_s = NaN;
+    roads(i).tune.steer.pid.milestones_deg = [robot.hw.steer.center_deg]; % EDIT
+
+
+    %% =====================================================================
+    %  [4] A4 (ARC, R=800)  (T-junction node in your map list)
+    %% =====================================================================
     i = 4;
-    roads(i).id     = "4_ARC4";
-    roads(i).type   = "ARC";
-    roads(i).branch = "A";
-    roads(i).geometry = geom0;
-    roads(i).geometry.kind = "ARC";
-    
-    roads(i).geometry.cen   = G.c4_cen;
-    roads(i).geometry.r_mm  = G.c4_r;
-    roads(i).geometry.th_s  = G.c4_s;
-    roads(i).geometry.th_e  = G.c4_e;
-    roads(i).geometry.dir   = local_arcDir(G.c4_s, G.c4_e);
-    
-    roads(i).geometry.p_s   = G.p4_s;
-    roads(i).geometry.p_e   = G.p4_e;
-    roads(i).geometry.len_mm = abs(G.c4_r) * abs(G.c4_e - G.c4_s);
-    
-    roads(i).geometry.tan_s = local_arcTangent(G.c4_s, roads(i).geometry.dir);
-    roads(i).geometry.tan_e = local_arcTangent(G.c4_e, roads(i).geometry.dir);
-    roads(i).geometry.nor_s = local_rot90(roads(i).geometry.tan_s);
-    roads(i).geometry.nor_e = local_rot90(roads(i).geometry.tan_e);
-    
-    roads(i).profile = profile0;
-    roads(i).control = ctrl0;
-    roads(i).switch  = sw0;
-    roads(i).switch.next = "5_ARC5";
-    
-    %% ===== 8) Road 5: Arc5 (branch A, continuity computed, r=800) =====
+    roads(i).id   = "A4";
+    roads(i).type = "ARC";
+
+    roads(i).geom.start_xy_mm  = [-2331.37 1000.00];
+    roads(i).geom.end_xy_mm    = [-1765.69 1234.31];
+    roads(i).geom.center_xy_mm = [-2331.37 1800.00];
+    roads(i).geom.R_mm         = 800.00;
+
+    roads(i).switch.entry_condition = "FROM:L3";
+    roads(i).switch.exit_condition  = "ENC_REACH_SEG_END";
+    roads(i).switch.fallback        = "LOSTLINE->BLIND";
+    roads(i).switch.next_id_default = "A5";
+    roads(i).switch.branch_ids      = ["A7"]; % branch candidate
+
+    % Junction policy placeholders
+    roads(i).junction = struct();
+    roads(i).junction.isTjunction = true;
+    roads(i).junction.turn_default = "STRAIGHT"; % "LEFT"|"RIGHT"|"STRAIGHT" (EDIT)
+    roads(i).junction.turn_left_id  = "A7";
+    roads(i).junction.turn_right_id = "A5";      % placeholder
+    roads(i).junction.turn_straight_id = "A5";   % placeholder
+
+    roads(i).tune.drive.mode          = "CONST_SPEED";
+    roads(i).tune.drive.const_cmd_u11 = uint16(650);     % EDIT (slow down at junction)
+
+    roads(i).tune.steer.mode = "PID_MILESTONE";
+    roads(i).tune.steer.pid.Kp = NaN; roads(i).tune.steer.pid.Ki = NaN; roads(i).tune.steer.pid.Kd = NaN;
+    roads(i).tune.steer.pid.deadband_err = NaN;
+    roads(i).tune.steer.pid.I_min = NaN; roads(i).tune.steer.pid.I_max = NaN;
+    roads(i).tune.steer.pid.dLim_deg_per_s = NaN;
+    roads(i).tune.steer.pid.milestones_deg = [robot.hw.steer.center_deg]; % EDIT
+
+
+    %% =====================================================================
+    %  [5] A5 (ARC, R=800)
+    %% =====================================================================
     i = 5;
-    roads(i).id     = "5_ARC5";
-    roads(i).type   = "ARC";
-    roads(i).branch = "A";
-    roads(i).geometry = geom0;
-    roads(i).geometry.kind = "ARC";
-    
-    roads(i).geometry.cen   = G.c5_cen;
-    roads(i).geometry.r_mm  = G.c5_r;
-    roads(i).geometry.th_s  = G.c5_s;
-    roads(i).geometry.th_e  = G.c5_e;
-    roads(i).geometry.dir   = local_dirFromString(G.dir5);
-    
-    roads(i).geometry.p_s   = G.p5_s;
-    roads(i).geometry.p_e   = G.p5_e;
-    roads(i).geometry.len_mm = abs(G.c5_r) * abs(G.c5_e - G.c5_s);
-    
-    roads(i).geometry.tan_s = local_arcTangent(G.c5_s, roads(i).geometry.dir);
-    roads(i).geometry.tan_e = local_arcTangent(G.c5_e, roads(i).geometry.dir);
-    roads(i).geometry.nor_s = local_rot90(roads(i).geometry.tan_s);
-    roads(i).geometry.nor_e = local_rot90(roads(i).geometry.tan_e);
-    
-    roads(i).profile = profile0;
-    roads(i).control = ctrl0;
-    roads(i).switch  = sw0;
-    roads(i).switch.next = "6_LINE6";
-    
-    %% ===== 9) Road 6: Line6 (branch A) =====
+    roads(i).id   = "A5";
+    roads(i).type = "ARC";
+
+    roads(i).geom.start_xy_mm  = [-1765.69 1234.31];
+    roads(i).geom.end_xy_mm    = [-1168.63 1500.00];
+    roads(i).geom.center_xy_mm = [-1170.28  700.00];
+    roads(i).geom.R_mm         = 800.00;
+
+    roads(i).switch.entry_condition = "FROM:A4";
+    roads(i).switch.exit_condition  = "ENC_REACH_SEG_END";
+    roads(i).switch.fallback        = "LOSTLINE->BLIND";
+    roads(i).switch.next_id_default = "L6";
+
+    roads(i).tune.drive.mode          = "CONST_SPEED";
+    roads(i).tune.drive.const_cmd_u11 = uint16(700);     % EDIT
+    roads(i).tune.steer.mode = "PID_MILESTONE";
+    roads(i).tune.steer.pid.Kp = NaN; roads(i).tune.steer.pid.Ki = NaN; roads(i).tune.steer.pid.Kd = NaN;
+    roads(i).tune.steer.pid.deadband_err = NaN;
+    roads(i).tune.steer.pid.I_min = NaN; roads(i).tune.steer.pid.I_max = NaN;
+    roads(i).tune.steer.pid.dLim_deg_per_s = NaN;
+    roads(i).tune.steer.pid.milestones_deg = [robot.hw.steer.center_deg]; % EDIT
+
+
+    %% =====================================================================
+    %  [6] L6 (LINE)
+    %% =====================================================================
     i = 6;
-    roads(i).id     = "6_LINE6";
-    roads(i).type   = "LINE";
-    roads(i).branch = "A";
-    roads(i).geometry = geom0;
-    roads(i).geometry.kind = "LINE";
-    
-    roads(i).geometry.p_s = G.p6_s;
-    roads(i).geometry.p_e = G.p6_e;
-    
-    roads(i).geometry.len_mm = norm(roads(i).geometry.p_e - roads(i).geometry.p_s);
-    roads(i).geometry.tan_s  = local_unit(roads(i).geometry.p_e - roads(i).geometry.p_s);
-    roads(i).geometry.tan_e  = roads(i).geometry.tan_s;
-    roads(i).geometry.nor_s  = local_rot90(roads(i).geometry.tan_s);
-    roads(i).geometry.nor_e  = roads(i).geometry.nor_s;
-    
-    roads(i).profile = profile0;
-    roads(i).control = ctrl0;
-    roads(i).switch  = sw0;
-    roads(i).switch.next = ""; % end
-    
-    %% ===== 10) Road 7: Arc7 (branch B) =====
+    roads(i).id   = "L6";
+    roads(i).type = "LINE";
+
+    roads(i).geom.start_xy_mm  = [-1168.63 1500.00];
+    roads(i).geom.end_xy_mm    = [    0.00 1500.00];
+
+    roads(i).switch.entry_condition = "FROM:A5";
+    roads(i).switch.exit_condition  = "ENC_REACH_SEG_END";
+    roads(i).switch.fallback        = "LOSTLINE->BLIND";
+    roads(i).switch.next_id_default = "END";
+
+    roads(i).tune.drive.mode          = "CONST_SPEED";
+    roads(i).tune.drive.const_cmd_u11 = uint16(800);     % EDIT
+    roads(i).tune.steer.mode = "PID_MILESTONE";
+    roads(i).tune.steer.pid.Kp = NaN; roads(i).tune.steer.pid.Ki = NaN; roads(i).tune.steer.pid.Kd = NaN;
+    roads(i).tune.steer.pid.deadband_err = NaN;
+    roads(i).tune.steer.pid.I_min = NaN; roads(i).tune.steer.pid.I_max = NaN;
+    roads(i).tune.steer.pid.dLim_deg_per_s = NaN;
+    roads(i).tune.steer.pid.milestones_deg = [robot.hw.steer.center_deg]; % EDIT
+
+
+    %% =====================================================================
+    %  [7] A7 (ARC, R=800) (branch)
+    %% =====================================================================
     i = 7;
-    roads(i).id     = "7_ARC7";
-    roads(i).type   = "ARC";
-    roads(i).branch = "B";
-    roads(i).geometry = geom0;
-    roads(i).geometry.kind = "ARC";
-    
-    roads(i).geometry.cen   = G.c7_cen;
-    roads(i).geometry.r_mm  = G.c7_r;
-    roads(i).geometry.th_s  = G.c7_s;
-    roads(i).geometry.th_e  = G.c7_e;
-    roads(i).geometry.dir   = local_arcDir(G.c7_s, G.c7_e);
-    
-    roads(i).geometry.p_s   = G.p7_s;
-    roads(i).geometry.p_e   = G.p7_e;
-    roads(i).geometry.len_mm = abs(G.c7_r) * abs(G.c7_e - G.c7_s);
-    
-    roads(i).geometry.tan_s = local_arcTangent(G.c7_s, roads(i).geometry.dir);
-    roads(i).geometry.tan_e = local_arcTangent(G.c7_e, roads(i).geometry.dir);
-    roads(i).geometry.nor_s = local_rot90(roads(i).geometry.tan_s);
-    roads(i).geometry.nor_e = local_rot90(roads(i).geometry.tan_e);
-    
-    roads(i).profile = profile0;
-    roads(i).control = ctrl0;
-    roads(i).switch  = sw0;
-    roads(i).switch.next = "8_ARC8";
-    
-    %% ===== 11) Road 8: Arc8 (branch B, continuity computed, r=800) =====
+    roads(i).id   = "A7";
+    roads(i).type = "ARC";
+
+    roads(i).geom.start_xy_mm  = [-2331.37 1000.00];
+    roads(i).geom.end_xy_mm    = [-1765.69  765.69];
+    roads(i).geom.center_xy_mm = [-2331.37  200.00];
+    roads(i).geom.R_mm         = 800.00;
+
+    roads(i).switch.entry_condition = "FROM:A4_BRANCH";
+    roads(i).switch.exit_condition  = "ENC_REACH_SEG_END";
+    roads(i).switch.fallback        = "LOSTLINE->BLIND";
+    roads(i).switch.next_id_default = "A8";
+
+    roads(i).tune.drive.mode          = "CONST_SPEED";
+    roads(i).tune.drive.const_cmd_u11 = uint16(650);     % EDIT
+    roads(i).tune.steer.mode = "PID_MILESTONE";
+    roads(i).tune.steer.pid.Kp = NaN; roads(i).tune.steer.pid.Ki = NaN; roads(i).tune.steer.pid.Kd = NaN;
+    roads(i).tune.steer.pid.deadband_err = NaN;
+    roads(i).tune.steer.pid.I_min = NaN; roads(i).tune.steer.pid.I_max = NaN;
+    roads(i).tune.steer.pid.dLim_deg_per_s = NaN;
+    roads(i).tune.steer.pid.milestones_deg = [robot.hw.steer.center_deg]; % EDIT
+
+
+    %% =====================================================================
+    %  [8] A8 (ARC, R=800)
+    %% =====================================================================
     i = 8;
-    roads(i).id     = "8_ARC8";
-    roads(i).type   = "ARC";
-    roads(i).branch = "B";
-    roads(i).geometry = geom0;
-    roads(i).geometry.kind = "ARC";
-    
-    roads(i).geometry.cen   = G.c8_cen;
-    roads(i).geometry.r_mm  = G.c8_r;
-    roads(i).geometry.th_s  = G.c8_s;
-    roads(i).geometry.th_e  = G.c8_e;
-    roads(i).geometry.dir   = local_dirFromString(G.dir8);
-    
-    roads(i).geometry.p_s   = G.p8_s;
-    roads(i).geometry.p_e   = G.p8_e;
-    roads(i).geometry.len_mm = abs(G.c8_r) * abs(G.c8_e - G.c8_s);
-    
-    roads(i).geometry.tan_s = local_arcTangent(G.c8_s, roads(i).geometry.dir);
-    roads(i).geometry.tan_e = local_arcTangent(G.c8_e, roads(i).geometry.dir);
-    roads(i).geometry.nor_s = local_rot90(roads(i).geometry.tan_s);
-    roads(i).geometry.nor_e = local_rot90(roads(i).geometry.tan_e);
-    
-    roads(i).profile = profile0;
-    roads(i).control = ctrl0;
-    roads(i).switch  = sw0;
-    roads(i).switch.next = "9_LINE9";
-    
-    %% ===== 12) Road 9: Line9 (branch B) =====
+    roads(i).id   = "A8";
+    roads(i).type = "ARC";
+
+    roads(i).geom.start_xy_mm  = [-1765.69  765.69];
+    roads(i).geom.end_xy_mm    = [-1168.63  500.00];
+    roads(i).geom.center_xy_mm = [-1170.28 1300.00];
+    roads(i).geom.R_mm         = 800.00;
+
+    roads(i).switch.entry_condition = "FROM:A7";
+    roads(i).switch.exit_condition  = "ENC_REACH_SEG_END";
+    roads(i).switch.fallback        = "LOSTLINE->BLIND";
+    roads(i).switch.next_id_default = "L9";
+
+    roads(i).tune.drive.mode          = "CONST_SPEED";
+    roads(i).tune.drive.const_cmd_u11 = uint16(650);     % EDIT
+    roads(i).tune.steer.mode = "PID_MILESTONE";
+    roads(i).tune.steer.pid.Kp = NaN; roads(i).tune.steer.pid.Ki = NaN; roads(i).tune.steer.pid.Kd = NaN;
+    roads(i).tune.steer.pid.deadband_err = NaN;
+    roads(i).tune.steer.pid.I_min = NaN; roads(i).tune.steer.pid.I_max = NaN;
+    roads(i).tune.steer.pid.dLim_deg_per_s = NaN;
+    roads(i).tune.steer.pid.milestones_deg = [robot.hw.steer.center_deg]; % EDIT
+
+
+    %% =====================================================================
+    %  [9] L9 (LINE)
+    %% =====================================================================
     i = 9;
-    roads(i).id     = "9_LINE9";
-    roads(i).type   = "LINE";
-    roads(i).branch = "B";
-    roads(i).geometry = geom0;
-    roads(i).geometry.kind = "LINE";
-    
-    roads(i).geometry.p_s = G.p9_s;
-    roads(i).geometry.p_e = G.p9_e;
-    
-    roads(i).geometry.len_mm = norm(roads(i).geometry.p_e - roads(i).geometry.p_s);
-    roads(i).geometry.tan_s  = local_unit(roads(i).geometry.p_e - roads(i).geometry.p_s);
-    roads(i).geometry.tan_e  = roads(i).geometry.tan_s;
-    roads(i).geometry.nor_s  = local_rot90(roads(i).geometry.tan_s);
-    roads(i).geometry.nor_e  = roads(i).geometry.nor_s;
-    
-    roads(i).profile = profile0;
-    roads(i).control = ctrl0;
-    roads(i).switch  = sw0;
-    roads(i).switch.next = ""; % end
+    roads(i).id   = "L9";
+    roads(i).type = "LINE";
+
+    roads(i).geom.start_xy_mm  = [-1168.63  500.00];
+    roads(i).geom.end_xy_mm    = [    0.00  500.00];
+
+    roads(i).switch.entry_condition = "FROM:A8";
+    roads(i).switch.exit_condition  = "ENC_REACH_SEG_END";
+    roads(i).switch.fallback        = "LOSTLINE->BLIND";
+    roads(i).switch.next_id_default = "END";
+
+    roads(i).tune.drive.mode          = "CONST_SPEED";
+    roads(i).tune.drive.const_cmd_u11 = uint16(800);     % EDIT
+    roads(i).tune.steer.mode = "PID_MILESTONE";
+    roads(i).tune.steer.pid.Kp = NaN; roads(i).tune.steer.pid.Ki = NaN; roads(i).tune.steer.pid.Kd = NaN;
+    roads(i).tune.steer.pid.deadband_err = NaN;
+    roads(i).tune.steer.pid.I_min = NaN; roads(i).tune.steer.pid.I_max = NaN;
+    roads(i).tune.steer.pid.dLim_deg_per_s = NaN;
+    roads(i).tune.steer.pid.milestones_deg = [robot.hw.steer.center_deg]; % EDIT
+
+
+    %% =====================================================================
+    %  [10] END
+    %% =====================================================================
+    i = 10;
+    roads(i).id   = "END";
+    roads(i).type = "END";
+
+    roads(i).switch.entry_condition = "REACHED_FINAL";
+    roads(i).switch.exit_condition  = "NONE";
+    roads(i).switch.fallback        = "NONE";
+    roads(i).switch.next_id_default = "";
+
+    roads(i).tune.drive.mode          = "CONST_SPEED";
+    roads(i).tune.drive.const_cmd_u11 = uint16(0);
+    roads(i).tune.steer.mode          = "PID_MILESTONE";
+    roads(i).tune.steer.pid.milestones_deg = [robot.hw.steer.center_deg];
+
+    roads(i).motion.profile.valid = true;
+    roads(i).motion.profile.type  = "STOP";
+
+
+    %% =====================================================================
+    %  [11] AVOID (obstacle avoidance)
+    %% =====================================================================
+    i = 11;
+    roads(i).id   = "AVOID";
+    roads(i).type = "AVOID";
+
+    roads(i).switch.entry_condition = "OBSTACLE_DETECTED";
+    roads(i).switch.exit_condition  = "OBSTACLE_CLEARED";
+    roads(i).switch.fallback        = "TIMEOUT->IDLE";
+    roads(i).switch.next_id_default = ""; % will be set at runtime (return-to-road)
+
+    roads(i).tune.drive.mode          = "CONST_SPEED";
+    roads(i).tune.drive.const_cmd_u11 = uint16(400);     % EDIT: slow
+
+    roads(i).tune.steer.mode = "ONOFF";
+    roads(i).tune.steer.onoff.th_on        = NaN;
+    roads(i).tune.steer.onoff.th_off       = NaN;
+    roads(i).tune.steer.onoff.cmd_left_deg = NaN;
+    roads(i).tune.steer.onoff.cmd_right_deg= NaN;
 
 end
 
-%% ========================================================================
-%  Local helpers (grouped for convenient tuning / editing)
-%  - Everything not "tuning" or not "road struct schema" stays here.
-%  - You can paste/copy your map.m primitive definitions into
-%    local_buildMapPrimitives() without changing cfg_roads() above.
-% ========================================================================
+function r = cfg_oneRoad(robot)
+    r = struct();
 
-function geom = local_geomTemplate()
-    % Unified geometry struct for ALL road types.
-    % Non-applicable fields must remain NaN (or 0 if you prefer).
-    geom = struct();
-    geom.kind   = "";              % "LINE" / "ARC" / "JUNCTION" (if later)
-    geom.branch = "";              % "MAIN"/"A"/"B" (optional mirror of roads(i).branch)
-    
-    % Key points
-    geom.p_s = [NaN NaN];
-    geom.p_e = [NaN NaN];
-    
-    % Common derived
-    geom.len_mm = NaN;
-    
-    % Line features (valid for LINE)
-    geom.tan_s = [NaN NaN];
-    geom.tan_e = [NaN NaN];
-    geom.nor_s = [NaN NaN];
-    geom.nor_e = [NaN NaN];
-    
-    % Arc features (valid for ARC)
-    geom.cen  = [NaN NaN];
-    geom.r_mm = NaN;
-    geom.th_s = NaN;
-    geom.th_e = NaN;
-    geom.dir  = NaN;               % +1 ccw, -1 cw
-    
-    % Reserved (keep unified even if unused now)
-    geom.kappa_s = NaN;            % curvature at start (1/r)
-    geom.kappa_e = NaN;            % curvature at end   (1/r)
-    geom.note = "";
+    r.id   = "";
+    r.type = "";
 
-end
+    r.geom = struct('start_xy_mm',[NaN NaN],'end_xy_mm',[NaN NaN],'center_xy_mm',[NaN NaN],'R_mm',NaN);
 
-function prof = local_profileTemplate(robot)
-    prof = struct();
-    prof.encoder_total = NaN;
-    prof.v_min = NaN;
-    prof.v_max = NaN;
-    prof.t_total = NaN;
-    
-    prof.v_end_prev = NaN;
-    prof.unit = "mmps";     % keep consistent with your main controller
-    prof.ts   = robot.ts.comm_s;
-    
-    prof.profile = [];      % will be filled by cfg_motionProfile()
-    prof.gen = struct('name',"generateProfile",'args',struct('vmax',NaN,'vmin',NaN,'t_total',NaN,'encoder_total',NaN,'v0',NaN,'v1',NaN));
-end
+    r.switch = struct();
+    r.switch.entry_condition = "";
+    r.switch.exit_condition  = "";
+    r.switch.fallback        = "";
+    r.switch.next_id_default = "";
+    r.switch.branch_ids      = strings(1,0);
 
-function ctrl = local_controlTemplate()
-    % Keep placeholders; fill later in road-specific tuning.
-    emptyPID  = struct('Kp',NaN,'Ki',NaN,'Kd',NaN,'u_min',NaN,'u_max',NaN,'i_limit',NaN,'ff',NaN);
-    emptyOnOff = struct('th',NaN,'hys',NaN,'u_low',NaN,'u_high',NaN);
-    
-    ctrl = struct();
-    ctrl.drive = struct('mode',"SPEED",'pid',emptyPID);
-    ctrl.steer = struct('mode',"PID",'pid',emptyPID,'onoff',emptyOnOff);
-end
+    r.junction = struct();
+    r.junction.isTjunction = false;
+    r.junction.turn_default = "";
+    r.junction.turn_left_id = "";
+    r.junction.turn_right_id = "";
+    r.junction.turn_straight_id = "";
 
-function sw = local_switchTemplate()
-    sw = struct();
-    sw.entry  = "";
-    sw.exit   = "";
-    sw.next   = "";
-    sw.nextA  = "";
-    sw.nextB  = "";
-    sw.policy = "";
-end
+    r.tune = struct();
 
-function M = local_buildMapPrimitives()
-    % Paste your original map.m "primitives" here:
-    % - l1_s,l1_e,l3_s,l3_e,l6_s,l6_e,l9_s,l9_e
-    % - c2_cen,c2_r,c2_s,c2_e
-    % - c4_cen,c4_r,c4_s,c4_e
-    % - c7_cen,c7_r,c7_s,c7_e
-    %
-    % Keep as symbols/expressions; do NOT hardcode numeric values in cfg_roads.
-    
-    M = struct();
-    
-    % ---- Lines (start/end) ----
-    M.l1_s = [NaN NaN];  M.l1_e = [NaN NaN];
-    M.l3_s = [NaN NaN];  M.l3_e = [NaN NaN];
-    M.l6_s = [NaN NaN];  M.l6_e = [NaN NaN];
-    M.l9_s = [NaN NaN];  M.l9_e = [NaN NaN];
-    
-    % ---- Arcs (center, radius, angles) ----
-    M.c2_cen = [NaN NaN]; M.c2_r = NaN; M.c2_s = NaN; M.c2_e = NaN;
-    M.c4_cen = [NaN NaN]; M.c4_r = NaN; M.c4_s = NaN; M.c4_e = NaN;
-    M.c7_cen = [NaN NaN]; M.c7_r = NaN; M.c7_s = NaN; M.c7_e = NaN;
-    
-    % ---- Constant used in your snippet (kept for parity) ----
-    M.t = tan(pi/8);
+    r.tune.drive = struct();
+    r.tune.drive.mode          = "CONST_SPEED";
+    r.tune.drive.const_cmd_u11 = uint16(0);
+    r.tune.drive.pid_speed = struct('Kp',NaN,'Ki',NaN,'Kd',NaN,'u_min',0,'u_max',double(robot.limits.drive.cmd_max),'aw_enable',true,'aw_gain',NaN);
 
-end
+    r.tune.steer = struct();
+    r.tune.steer.mode = "PID_MILESTONE";
+    r.tune.steer.pid  = struct( ...
+        'Kp',NaN,'Ki',NaN,'Kd',NaN, ...
+        'deadband_err',NaN, ...
+        'I_min',NaN,'I_max',NaN, ...
+        'dLim_deg_per_s',NaN, ...
+        'milestones_deg',[robot.hw.steer.center_deg], ...
+        'overshoot_guard',struct('enable',true,'next_guard_deg',NaN) ...
+    );
+    r.tune.steer.onoff = struct('th_on',NaN,'th_off',NaN,'cmd_left_deg',NaN,'cmd_right_deg',NaN);
 
-function G = local_computeDerivedGeometry(M)
-    % Implements the continuity fix for Arc5 and Arc8, and computes all segment endpoints.
-    
-    G = struct();
-    
-    % ===== Segment 1 endpoints
-    G.p1_s = M.l1_s;
-    G.p1_e = M.l1_e;
-    
-    % ===== Segment 2 endpoints (Arc2)
-    G.c2_cen = M.c2_cen; G.c2_r = M.c2_r; G.c2_s = M.c2_s; G.c2_e = M.c2_e;
-    G.p2_s = M.c2_cen + M.c2_r*[cos(M.c2_s) sin(M.c2_s)];
-    G.p2_e = M.c2_cen + M.c2_r*[cos(M.c2_e) sin(M.c2_e)];
-    
-    % ===== Segment 3 endpoints
-    G.p3_s = M.l3_s;
-    G.p3_e = M.l3_e;
-    G.pJ   = G.p3_e;
-    
-    % ===== Segment 4 (Arc4) endpoints
-    G.c4_cen = M.c4_cen; G.c4_r = M.c4_r; G.c4_s = M.c4_s; G.c4_e = M.c4_e;
-    G.p4_s = G.pJ;
-    G.p4_e = M.c4_cen + M.c4_r*[cos(M.c4_e) sin(M.c4_e)];
-    
-    % ===== Segment 7 (Arc7) endpoints
-    G.c7_cen = M.c7_cen; G.c7_r = M.c7_r; G.c7_s = M.c7_s; G.c7_e = M.c7_e;
-    G.p7_s = G.pJ;
-    G.p7_e = M.c7_cen + M.c7_r*[cos(M.c7_e) sin(M.c7_e)];
-    
-    % ===== Segment 6 line start for continuity target of Arc5
-    G.p6_s = M.l6_s;
-    G.p6_e = M.l6_e;
-    
-    % ===== Segment 9 line start for continuity target of Arc8
-    G.p9_s = M.l9_s;
-    G.p9_e = M.l9_e;
-    
-    % ===== Arc5 compute (connect p4_e -> l6_s) with r=800
-    r = 800;
-    P1 = G.p4_e;           % MUST equal Arc4 end
-    P2 = G.p6_s;           % MUST equal Line6 start
-    
-    [d,Mm,u,perp,h,C1,C2] = local_twoCircleCenters(P1, P2, r);
-    
-    theta4e = M.c4_e;
-    t_des = [-sin(theta4e) cos(theta4e)];  % CCW tangent at arc4 end
-    
-    [c5_cen, dir5] = local_chooseArcCenterDir(P1, C1, C2, t_des);
-    c5_s = atan2(P1(2)-c5_cen(2), P1(1)-c5_cen(1));
-    c5_e = atan2(P2(2)-c5_cen(2), P2(1)-c5_cen(1));
-    [c5_s, c5_e] = local_fixSweep(c5_s, c5_e, dir5);
-    
-    G.c5_cen = c5_cen;
-    G.c5_r   = r;
-    G.c5_s   = c5_s;
-    G.c5_e   = c5_e;
-    G.dir5   = dir5;
-    
-    G.p5_s = P1;
-    G.p5_e = P2;
-    
-    % ===== Arc8 compute (connect p7_e -> l9_s) with r=800
-    r = 800;
-    P1 = G.p7_e;           % MUST equal Arc7 end
-    P2 = G.p9_s;           % MUST equal Line9 start
-    
-    [d,Mm,u,perp,h,C1,C2] = local_twoCircleCenters(P1, P2, r);
-    
-    theta7e = M.c7_e;
-    t_des = [ sin(theta7e) -cos(theta7e)];  % CW tangent at arc7 end
-    
-    [c8_cen, dir8] = local_chooseArcCenterDir(P1, C1, C2, t_des);
-    c8_s = atan2(P1(2)-c8_cen(2), P1(1)-c8_cen(1));
-    c8_e = atan2(P2(2)-c8_cen(2), P2(1)-c8_cen(1));
-    [c8_s, c8_e] = local_fixSweep(c8_s, c8_e, dir8);
-    
-    G.c8_cen = c8_cen;
-    G.c8_r   = r;
-    G.c8_s   = c8_s;
-    G.c8_e   = c8_e;
-    G.dir8   = dir8;
-    
-    G.p8_s = P1;
-    G.p8_e = P2;
-
-end
-
-function [d,Mm,u,perp,h,C1,C2] = local_twoCircleCenters(P1,P2,r)
-    d  = norm(P2 - P1);
-    Mm = 0.5*(P1 + P2);
-    u  = (P2 - P1)/d;
-    perp = [-u(2) u(1)];
-    h  = sqrt(r^2 - (d/2)^2);
-    C1 = Mm + h*perp;
-    C2 = Mm - h*perp;
-end
-
-function [cen, dirStr] = local_chooseArcCenterDir(P1, C1, C2, t_des)
-    thetaC1_s = atan2(P1(2)-C1(2), P1(1)-C1(1));
-    thetaC2_s = atan2(P1(2)-C2(2), P1(1)-C2(1));
-    tC1_ccw = [-sin(thetaC1_s) cos(thetaC1_s)];
-    tC1_cw  = [ sin(thetaC1_s) -cos(thetaC1_s)];
-    tC2_ccw = [-sin(thetaC2_s) cos(thetaC2_s)];
-    tC2_cw  = [ sin(thetaC2_s) -cos(thetaC2_s)];
-    
-    score = [
-        dot(tC1_ccw,t_des)
-        dot(tC1_cw ,t_des)
-        dot(tC2_ccw,t_des)
-        dot(tC2_cw ,t_des)
-    ];
-    [~,k] = max(score);
-    
-    if k==1, cen=C1; dirStr="ccw";
-    elseif k==2, cen=C1; dirStr="cw";
-    elseif k==3, cen=C2; dirStr="ccw";
-    else, cen=C2; dirStr="cw";
-    end
-end
-
-function [th_s, th_e] = local_fixSweep(th_s, th_e, dirStr)
-    if dirStr=="ccw" && th_e < th_s
-        th_e = th_e + 2*pi;
-    end
-    if dirStr=="cw"  && th_e > th_s
-        th_e = th_e - 2*pi;
-    end
-end
-
-function v = local_unit(v)
-    n = norm(v);
-    if n < eps
-        v = [NaN NaN];
-    else
-        v = v / n;
-    end
-end
-
-function v = local_rot90(v)
-    v = [-v(2) v(1)];
-end
-
-function dir = local_arcDir(th_s, th_e)
-% Heuristic: if th_e >= th_s => ccw (+1) else cw (-1)
-% For computed arcs (Arc5/Arc8) we override using dir5/dir8.
-    if th_e >= th_s
-        dir = +1;
-    else
-        dir = -1;
-    end
-end
-
-function t = local_arcTangent(theta, dir)
-% Unit tangent for circle at angle theta.
-% ccw: [-sin cos], cw: [sin -cos]
-    if dir >= 0
-        t = [-sin(theta) cos(theta)];
-    else
-        t = [ sin(theta) -cos(theta)];
-    end
-end
-
-function dir = local_dirFromString(dirStr)
-    if dirStr=="ccw"
-        dir = +1;
-    else
-        dir = -1;
-    end
+    r.motion = struct('encoder_count_seg',NaN,'v0_prev_end',NaN,'vmax',NaN,'vmin',NaN,'t_finish',NaN);
+    r.motion.profile = struct('valid',false,'type',"TRAPEZOID",'data',[]);
 end
