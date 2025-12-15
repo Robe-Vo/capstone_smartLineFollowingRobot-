@@ -279,13 +279,10 @@ void com_process(void *parameter) {
                         uint8_t hi, lo;
                         if (server.getUint8(hi) && server.getUint8(lo)) {
                             speed_u16_cmd = u16_be(hi, lo);
-                            Serial.printf("RX DF hi=%u lo=%u speed=%u\n", hi, lo, speed_u16_cmd);
                             flag_run_drive_forward = true;
                         } else {
-                            Serial.println("RX DF missing hi/lo");
                             ok = false;
                         }
-
                     } break;
 
                     case 0xDE: {
@@ -501,10 +498,7 @@ void OPERATION_process(void *parameter) {
             } else {
                 driveForward_u16(speed_u16_cmd);
                 setSteerAngle(steer_angle);
-                Serial.print("Speed value u16: ");
-                Serial.print(speed_u16_cmd);
-                Serial.print(" -> PWM 11-bit: ");
-                Serial.println(pwm11_from_u16(speed_u16_cmd));
+
             }
         }
 

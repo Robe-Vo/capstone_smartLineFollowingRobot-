@@ -1,3 +1,4 @@
+% File: +capstone/+io/Network.m
 classdef Network < handle
     properties
         conn % struct: fields: type, dev, (ip,port) for UDP
@@ -32,11 +33,12 @@ classdef Network < handle
             obj.conn = struct("type","tcp","dev",t);
         end
 
+        % ===================== TX/RX PRIMITIVES =====================
         function sendBytes(obj, payload_u8)
-            % Send an arbitrary uint8 vector (preferred for frames)
             if isempty(obj.conn), return; end
             c = obj.conn;
             b = uint8(payload_u8(:));
+
             if c.type == "bt" || c.type == "tcp"
                 write(c.dev, b, "uint8");
             elseif c.type == "udp"
@@ -44,12 +46,11 @@ classdef Network < handle
             end
         end
 
-        function sendByte(obj, data)
-            obj.sendBytes(uint8(data));
+        function sendByte(obj, data_u8)
+            obj.sendBytes(uint8(data_u8));
         end
 
         function rx = recvBytes(obj, n)
-            % Read up to n bytes non-blocking for bt/tcp, or one datagram for udp.
             if isempty(obj.conn)
                 rx = uint8([]);
                 return;
@@ -59,7 +60,7 @@ classdef Network < handle
 
             if c.type == "bt" || c.type == "tcp"
                 if c.dev.NumBytesAvailable > 0
-                    k = min(n, c.dev.NumBytesAvailable);
+                    k  = min(n, c.dev.NumBytesAvailable);
                     rx = read(c.dev, k, "uint8");
                 end
             elseif c.type == "udp"
@@ -101,95 +102,133 @@ classdef Network < handle
             end
         end
 
-        % ===================== OPERATION CONTROL (5 BYTES) =====================
-        function pkt = packOp5(obj, cmd_u8, speed_u16, angle_u16)
-            % Pack OPERATION control frame (5 bytes, little-endian):
-            %   [cmd][spd_L][spd_H][ang_L][ang_H]
-            % speed_u16: 0..65535; robot scales to 11-bit PWM internally (>>5).
-            %#ok<INUSD>
-            cmd = uint8(cmd_u8);
-            spd = uint16(speed_u16);
-            ang = uint16(angle_u16);
-
-            spd_L = uint8(bitand(spd, 255));
-            spd_H = uint8(bitshift(spd, -8));
-
-            ang_L = uint8(bitand(ang, 255));
-            ang_H = uint8(bitshift(ang, -8));
-
-            pkt = uint8([cmd; spd_L; spd_H; ang_L; ang_H]);
+        % ===================== OPERATION MODE HELPERS =====================
+        function ok = opEnter(obj, ackTimeout)
+            % Send 0xFF and wait ACK 0x20
+            if nargin < 2, ackTimeout = 2.0; end
+            p = capstone.io.Protocol.constants();
+            obj.sendByte(p.CMD_MODE_OP);
+            ok = obj.waitAck(ackTimeout);
         end
 
-        function [cmd_u8, speed_u16, angle_u16] = unpackOp5(obj, pkt)
-            % Unpack OPERATION control frame (5 bytes, little-endian).
-            %#ok<INUSD>
-            if isempty(pkt) || numel(pkt) ~= 5
-                cmd_u8   = uint8(0);
-                speed_u16 = uint16(0);
-                angle_u16 = uint16(0);
+        function opExitToIdle(obj)
+            % Send 0xFE (no ACK assumed)
+            p = capstone.io.Protocol.constants();
+            obj.sendByte(p.CMD_MODE_IDLE);
+        end
+
+        % ===================== SPEED CONVERSION (% -> PWM11) =====================
+        function spd11 = opPwm11FromPercent(~, percent)
+            % percent: -100..+100
+            % spd11  : 0..2047 (abs mapping)
+            if ~isscalar(percent) || ~isnumeric(percent)
+                spd11 = uint16(0);
                 return;
             end
-            p = uint8(pkt(:));
-            cmd_u8 = p(1);
-
-            speed_u16 = uint16(p(2)) + bitshift(uint16(p(3)), 8);
-            angle_u16 = uint16(p(4)) + bitshift(uint16(p(5)), 8);
+            x = double(percent);
+            x = max(-100, min(100, x));
+            spd11 = uint16(round(abs(x) / 100 * 2047));
         end
 
-        function sendControlOp5(obj, speed_u16, angle_u16, cmd_u8)
-            % Send OPERATION control frame (5 bytes, LE):
-            %   cmd(1B) + speed(2B) + angle(2B)
-            % Default cmd is 0xF1.
-            if nargin < 4 || isempty(cmd_u8)
-                cmd_u8 = uint8(hex2dec('F1'));
-            end
-            pkt = obj.packOp5(cmd_u8, speed_u16, angle_u16);
+        % ===================== OPERATION CONTROL FRAME (5 BYTES, LE) =====================
+        function pkt = opPack5(~, cmd_u8, spd11_u16, ang_u16)
+            % [cmd][spd_L][spd_H][ang_L][ang_H]  (LE)
+            cmd = uint8(cmd_u8);
+
+            spd = uint16(spd11_u16);
+            if spd > 2047, spd = 2047; end
+
+            ang = uint16(ang_u16);
+
+            pkt = uint8([
+                cmd
+                bitand(spd,255)
+                bitshift(spd,-8)
+                bitand(ang,255)
+                bitshift(ang,-8)
+            ]);
+        end
+
+        function opSendControl(obj, speed_percent, angle_u16)
+            % Send OPERATION control (CMD 0xF1), speed is percent, TX speed is 11-bit (0..2047)
+            p = capstone.io.Protocol.constants();
+            spd11 = obj.opPwm11FromPercent(speed_percent);
+            pkt = obj.opPack5(p.CMD_OP_CTRL, spd11, uint16(angle_u16));
             obj.sendBytes(pkt);
         end
 
-        function [ok, cmd_u8, speed_u16, angle_u16] = recvControlOp5(obj, timeout)
-            % Receive OPERATION control frame (5 bytes, LE) using blocking read.
-            if nargin < 2, timeout = 1.0; end
-            ok = false;
-            cmd_u8 = uint8(0);
-            speed_u16 = uint16(0);
-            angle_u16 = uint16(0);
-
-            pkt = obj.readFrameBlocking(5, timeout);
-            if isempty(pkt), return; end
-            ok = true;
-            [cmd_u8, speed_u16, angle_u16] = obj.unpackOp5(pkt);
+        function opSendStop(obj)
+            % Send OPERATION stop (CMD 0xF0)
+            p = capstone.io.Protocol.constants();
+            obj.sendByte(p.CMD_OP_STOP);
         end
 
-        % Backward compatible name (keeps your existing PID code usage)
-        function sendControl(obj, speed_u16, angle_u16, cmd)
-            % Alias to sendControlOp5()
-            if nargin < 4, cmd = uint8(hex2dec('F1')); end
-            obj.sendControlOp5(speed_u16, angle_u16, cmd);
-        end
-
+        % ===================== DIRECT DRIVE (BE, PWM11 0..2047) =====================
         function sendCmdU16BE(obj, cmd_u8, value_u16)
+            % Firmware expects: cmd + hi + lo, and uses u16_be(hi,lo)
             if isempty(obj.conn), return; end
-            cmd = uint8(cmd_u8);
-            v   = uint16(value_u16);
-            hi  = uint8(bitshift(v, -8));
-            lo  = uint8(bitand(v, 255));
-            obj.sendBytes(uint8([cmd; hi; lo]));
-        end
-    
-        function sendDriveStop(obj)
-            proto = capstone.io.Protocol.constants();
-            obj.sendByte(proto.CMD_DRIVE_STOP);
+            v = uint16(value_u16);
+            hi = uint8(bitshift(v, -8));
+            lo = uint8(bitand(v, 255));
+            obj.sendBytes(uint8([uint8(cmd_u8); hi; lo]));
         end
 
+        function opDriveStepPercent(obj, percent, timeout_s, varargin)
+            % opDriveStepPercent(net, percent, timeout_s, "enterOp", true/false, "exitIdle", true/false)
+            % - percent > 0  => forward (0xDF + PWM11 BE)
+            % - percent < 0  => backward (0xDE + PWM11 BE)
+            % - percent = 0  => stop (0xDD)
+            if nargin < 3, timeout_s = 1.0; end
+
+            ip = inputParser;
+            ip.addParameter("enterOp", true);
+            ip.addParameter("exitIdle", false);
+            ip.addParameter("ackTimeout", 2.0);
+            ip.parse(varargin{:});
+            opt = ip.Results;
+
+            p = capstone.io.Protocol.constants();
+
+            if opt.enterOp
+                ok = obj.opEnter(opt.ackTimeout);
+                if ok
+                    fprintf("[NET] OPERATION ACK OK\n");
+                else
+                    fprintf("[NET] WARN: OPERATION no ACK\n");
+                end
+            end
+
+            spd11 = obj.opPwm11FromPercent(percent); % 0..2047
+
+            cleanup = onCleanup(@() localStop(obj, p, opt.exitIdle));
+
+            if percent > 0
+                obj.sendCmdU16BE(p.CMD_DRIVE_FWD, spd11);
+                fprintf("[NET] STEP FWD %%=%.1f spd11=%d\n", double(percent), spd11);
+            elseif percent < 0
+                obj.sendCmdU16BE(p.CMD_DRIVE_BWD, spd11);
+                fprintf("[NET] STEP BWD %%=%.1f spd11=%d\n", double(percent), spd11);
+            else
+                obj.sendByte(p.CMD_DRIVE_STOP);
+                fprintf("[NET] STEP STOP\n");
+                pause(timeout_s);
+                return;
+            end
+
+            t0 = tic;
+            while toc(t0) < timeout_s
+                pause(0.005);
+            end
+        end
 
         % ===================== ACK =====================
         function ok = waitAck(obj, timeout)
             if nargin < 2, timeout = 1.0; end
             ok = false;
             if isempty(obj.conn), return; end
+            p = capstone.io.Protocol.constants();
+            target = p.ACK;
 
-            target = uint8(hex2dec('20'));
             t0 = tic;
             while toc(t0) < timeout
                 b = obj.recvByte();
@@ -197,7 +236,7 @@ classdef Network < handle
                     pause(0.001);
                     continue;
                 end
-                if b == target
+                if uint8(b) == uint8(target)
                     ok = true;
                     return;
                 end
@@ -206,6 +245,21 @@ classdef Network < handle
 
         function disconnect(obj)
             obj.conn = [];
+        end
+    end
+end
+
+function localStop(net, proto, exitIdle)
+    try
+        net.sendByte(proto.CMD_DRIVE_STOP); % 0xDD
+        fprintf("[NET] STOP sent (0xDD)\n");
+    catch
+    end
+    if exitIdle
+        try
+            net.sendByte(proto.CMD_MODE_IDLE); % 0xFE
+            fprintf("[NET] IDLE sent (0xFE)\n");
+        catch
         end
     end
 end
