@@ -63,6 +63,7 @@ public:
     bool getArrayUint8(uint8_t* buffer, size_t num);
     bool transmitArrayUint8(const uint8_t* buffer, size_t num);
     bool transmitUint8(uint8_t byte);
+    bool getFrame(uint8_t &cmd, uint16_t &speed, uint16_t &angle);
 
 private:
     bool ensureClient();

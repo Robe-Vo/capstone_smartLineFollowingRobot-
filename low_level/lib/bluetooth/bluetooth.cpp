@@ -185,3 +185,20 @@ bool Network::transmitUint8(uint8_t byte)
     Serial.println(byte, HEX);
     return true;
 }
+
+bool Network::getFrame(uint8_t &cmd, uint16_t &speed, uint16_t &angle)
+{
+    
+    uint8_t buffer[5];
+
+    // Try to read 5 bytes: cmd(1) | speed(2) | angle(2)
+    if (Network.getArrayUint8(buffer, 5))
+    {
+        cmd = buffer[0];
+        speed = (uint16_t)buffer[1] | ((uint16_t)buffer[2] << 8);
+        angle = (uint16_t)buffer[3] | ((uint16_t)buffer[4] << 8);
+        return true;
+    }
+    // Failed to read full frame
+    return false;
+}
