@@ -1,0 +1,357 @@
+#include "app.hpp"
+
+#include <Arduino.h>
+#include <ESP32Servo.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+
+#include "bluetooth.hpp"            // Network (GIỮ NGUYÊN)
+#include "actuators.hpp"            // MotorPWM11, Encoder
+#include "sensors.hpp"              // line_*, ultra_*
+#include "telemetry/telemetry.hpp"  // TelemetryOp22 (22B)
+
+#include "pin.hpp"
+#include "cfg.hpp"
+
+// =================== CORE PLAN ===================
+static constexpr int CORE0 = 0;
+static constexpr int CORE1 = 1;
+
+// =================== ACK ===================
+static constexpr uint8_t ACK_IDLE = 0x20;
+
+// =================== TYPES ===================
+enum class Mode : uint8_t { IDLE=0, OPERATION=1, FAULT=2 };
+
+struct CmdFrame {
+  uint32_t t_ms = 0;
+  Mode mode = Mode::IDLE;
+  uint8_t cmd = 0;
+  uint16_t speed_u16 = 0;
+  uint16_t angle_u16 = SERVO_MID_DEG;
+};
+
+struct ControlOut {
+  uint32_t t_ms = 0;
+  Mode mode = Mode::IDLE;
+  uint16_t pwm11 = 0;
+  int8_t dir = 0;
+  uint16_t servo_deg = SERVO_MID_DEG;
+};
+
+// =================== GLOBALS ===================
+static Network g_net;
+static Servo   g_servo;
+
+static QueueHandle_t qCmd     = nullptr; // latest CmdFrame
+static QueueHandle_t qControl = nullptr; // latest ControlOut
+static QueueHandle_t qTlm     = nullptr; // latest telemetry
+
+static volatile uint32_t g_last_rx_ms = 0;
+static Mode g_mode = Mode::IDLE;
+
+static int32_t g_enc_last_total = 0;
+
+static volatile bool g_motor_inited = false;
+static volatile bool g_servo_inited = false;
+
+// =================== DEBUG: Serial tap ===================
+static void app_serial_tap(const char* where)
+{
+  if (!Serial.available()) return;
+
+  Serial.print("[APP] "); Serial.print(where);
+  Serial.print(" | Serial.available="); Serial.println(Serial.available());
+
+  while (Serial.available()) {
+    int c = Serial.read();
+    if (c < 0) break;
+    uint8_t b = (uint8_t)c;
+    Serial.print("[APP] "); Serial.print(where); Serial.print(" | RX 0x");
+    if (b < 16) Serial.print('0');
+    Serial.println(b, HEX);
+  }
+}
+
+// =================== HELPERS ===================
+static inline uint16_t clamp_u16(uint16_t v, uint16_t lo, uint16_t hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+static inline int8_t clamp_i8(int32_t x) {
+  if (x > 127) return 127;
+  if (x < -128) return -128;
+  return (int8_t)x;
+}
+
+// setpoint -> pwm11
+// Nếu PC gửi 0..65535 => >>5.
+// Nếu PC gửi 0..2048 => đổi mapping cho đúng hệ bạn dùng.
+static inline uint16_t pwm11_from_speed_u16(uint16_t speed_u16) {
+  return (uint16_t)(speed_u16 >> 5);
+}
+
+// speed telemetry i16: mặc định Hz*10
+static int16_t speed_to_i16()
+{
+  float hz = Encoder::speed_get_hz_out();
+  float v = hz * 10.0f;
+  if (v > 32767.0f) v = 32767.0f;
+  if (v < -32768.0f) v = -32768.0f;
+  int32_t s = (int32_t)(v + (v >= 0 ? 0.5f : -0.5f));
+  return (int16_t)s;
+}
+
+// MPU adapter (nếu chưa có driver: 0)
+static void read_mpu6(int16_t out6[6]) {
+  for (int i = 0; i < 6; i++) out6[i] = 0;
+}
+
+static void apply_actuation(const ControlOut& u)
+{
+  // servo
+  if (g_servo_inited) {
+    uint16_t deg = clamp_u16(u.servo_deg, SERVO_MIN_DEG, SERVO_MAX_DEG);
+    g_servo.write((int)deg);
+  }
+
+  // motor gate (LEDC init)
+  if (!g_motor_inited) return;
+
+  if (u.mode != Mode::OPERATION || u.dir == 0 || u.pwm11 == 0) {
+    MotorPWM11::stopMotor();
+    return;
+  }
+
+  uint16_t speed_cmd = (u.pwm11 > 2047) ? 2047 : u.pwm11;
+  if (u.dir > 0) MotorPWM11::driveForward(speed_cmd);
+  else           MotorPWM11::driveBackward(speed_cmd);
+}
+
+static inline void idle_ack_ping() {
+  g_net.transmitUint8(ACK_IDLE);
+}
+
+// =================== TASKS ===================
+
+// Core0 / 50ms: RX + IDLE ACK + TX telemetry (1 frame)
+static void Task_Comm_50ms(void*)
+{
+  TickType_t last = xTaskGetTickCount();
+  for (;;)
+  {
+    app_serial_tap("Task_Comm_50ms");
+    const uint32_t now = millis();
+
+    Network::OpControlFrame f{};
+    if (g_net.opTryReadControlFrame(f)) {
+      CmdFrame cf{};
+      cf.t_ms = now;
+      cf.cmd = f.cmd;
+      cf.speed_u16 = f.speed;
+      cf.angle_u16 = f.angle;
+
+      // Quy tắc mode tối thiểu để test:
+      // - cmd == 0xFE: vào IDLE
+      // - ngược lại: OPERATION
+      if (f.cmd == 0xFE) g_mode = Mode::IDLE;
+      else               g_mode = Mode::OPERATION;
+
+      cf.mode = g_mode;
+
+      // IDLE: ACK 0x20 cho MỖI command nhận được
+      if (g_mode == Mode::IDLE) {
+        Serial.println("[APP] Task_Comm_50ms: IDLE ACK 0x20");
+        idle_ack_ping();
+      }
+
+      g_last_rx_ms = now;
+      if (qCmd) xQueueOverwrite(qCmd, &cf);
+    }
+
+    // TX telemetry: gửi 1 frame mới nhất nếu có
+    TelemetryOp22::Frame22 tf{};
+    if (qTlm && xQueueReceive(qTlm, &tf, 0) == pdTRUE) {
+      Serial.println("[APP] Task_Comm_50ms: send telemetry 22B");
+      TelemetryOp22::send(g_net, tf);
+    }
+
+    vTaskDelayUntil(&last, pdMS_TO_TICKS(TS_TELEM_MS));
+  }
+}
+
+// Core0 / 10ms: PID (skeleton) -> qControl
+static void Task_PID_10ms(void*)
+{
+  TickType_t last = xTaskGetTickCount();
+
+  CmdFrame cmd{};
+  cmd.mode = Mode::IDLE;
+  cmd.angle_u16 = SERVO_MID_DEG;
+
+  float integ = 0.0f;
+  float prev_e = 0.0f;
+
+  const float Kp = 1.0f;
+  const float Ki = 0.0f;
+  const float Kd = 0.0f;
+
+  for (;;)
+  {
+    const uint32_t now = millis();
+
+    CmdFrame newCmd{};
+    if (qCmd && xQueuePeek(qCmd, &newCmd, 0) == pdTRUE) cmd = newCmd;
+
+    // timeout -> IDLE
+    if ((uint32_t)(now - g_last_rx_ms) > OP_TIMEOUT_MS) {
+      cmd.mode = Mode::IDLE;
+      cmd.speed_u16 = 0;
+      g_mode = Mode::IDLE;
+    }
+
+    int16_t y_i16 = speed_to_i16();
+
+    // Domain placeholder (bạn sẽ align sau)
+    float sp = (float)cmd.speed_u16;
+    float y  = (float)y_i16;
+
+    float dt = (float)TS_CONTROLLER_MS * 0.001f;
+    float e = sp - y;
+    integ += e * dt;
+    float der = (e - prev_e) / dt;
+    prev_e = e;
+
+    float u = Kp*e + Ki*integ + Kd*der;
+    if (u < 0.0f) u = 0.0f;
+    if (u > 2047.0f) u = 2047.0f;
+
+    ControlOut out{};
+    out.t_ms = now;
+    out.mode = cmd.mode;
+    out.dir  = (cmd.mode == Mode::OPERATION) ? 1 : 0;
+    out.pwm11 = (uint16_t)u;
+    out.servo_deg = clamp_u16(cmd.angle_u16, SERVO_MIN_DEG, SERVO_MAX_DEG);
+
+    if (qControl) xQueueOverwrite(qControl, &out);
+
+    vTaskDelayUntil(&last, pdMS_TO_TICKS(TS_CONTROLLER_MS));
+  }
+}
+
+// Core0 / sensors: build telemetry 22B (overwrite latest)
+static void Task_Sensors(void*)
+{
+  TickType_t last = xTaskGetTickCount();
+  for (;;)
+  {
+    uint8_t line5[5] = {0};
+    // line_setup của bạn nhận pin theo thứ tự nào thì giữ đúng thứ tự đó
+    if (uint8_t* p = line_readSignals()) for (int i=0;i<5;i++) line5[i] = p[i];
+
+    uint16_t ultra_u16 = ultra_getSignal();
+
+    int16_t mpu6[6];
+    read_mpu6(mpu6);
+
+    int32_t total = Encoder::encoder_get_total();
+    int32_t d = total - g_enc_last_total;
+    g_enc_last_total = total;
+    int8_t enc_i8 = clamp_i8(d);
+
+    int16_t speed_i16 = speed_to_i16();
+
+    auto fr = TelemetryOp22::pack(line5, ultra_u16, mpu6, enc_i8, speed_i16);
+
+    if (qTlm) xQueueOverwrite(qTlm, &fr);
+
+    vTaskDelayUntil(&last, pdMS_TO_TICKS(TS_CONTROLLER_MS));
+  }
+}
+
+// Core1: motor apply
+static void Task_Motor(void*)
+{
+  ControlOut out{};
+  out.mode = Mode::IDLE;
+  for (;;)
+  {
+    if (qControl && xQueueReceive(qControl, &out, portMAX_DELAY) == pdTRUE) {
+      Serial.println("[APP] Task_Motor: apply_actuation()");
+      apply_actuation(out);
+    }
+  }
+}
+
+// Core1: ultra kick
+static void Task_UltraKick(void*)
+{
+  TickType_t last = xTaskGetTickCount();
+  for (;;)
+  {
+    ultra_kick();
+    vTaskDelayUntil(&last, pdMS_TO_TICKS(TIME_KICK_ULTRA));
+  }
+}
+
+// =================== PUBLIC ===================
+void App_setup()
+{
+  Serial.begin(115200);
+  Serial.println("[APP] App_setup()");
+
+  // Network
+  g_net.begin();
+  g_last_rx_ms = millis();
+
+  // Sensors
+  // LƯU Ý: line_setup của bạn có thể nhận (pin1..pin5) theo index.
+  // Bạn đang định nghĩa idx_1..idx_5, nên truyền đúng:
+  line_setup(LINE_SENSOR_IDX_1_PIN, LINE_SENSOR_IDX_2_PIN, LINE_SENSOR_IDX_3_PIN,
+             LINE_SENSOR_IDX_4_PIN, LINE_SENSOR_IDX_5_PIN);
+
+  ultra_setup(ULTRASONIC_TRIG_PIN, ULTRASONIC_ECHO_PIN);
+  attachInterrupt(ULTRASONIC_ECHO_PIN, hanlder_ultra_echo, CHANGE);
+
+  // Motor PWM (fix LEDC not initialized)
+  MotorPWM11::begin(MOTOR_PWM_PIN, MOTOR_OUT_1_PIN, MOTOR_OUT_2_PIN, PWM_CH_MOTOR, PWM_FREQ_HZ);
+  g_motor_inited = true;
+
+  // Encoder
+  pinMode(ENCODER_CHANNEL_A_PIN, INPUT_PULLUP);
+  pinMode(ENCODER_CHANNEL_B_PIN, INPUT_PULLUP);
+  attachInterrupt(ENCODER_CHANNEL_A_PIN, Encoder::isr_encoder_AB, CHANGE);
+  attachInterrupt(ENCODER_CHANNEL_B_PIN, Encoder::isr_encoder_AB, CHANGE);
+
+  // Servo
+  g_servo.setPeriodHertz(50);
+  g_servo.attach(SERVO_PIN);
+  g_servo.write((int)SERVO_MID_DEG);
+  g_servo_inited = true;
+
+  // Init baseline
+  g_enc_last_total = Encoder::encoder_get_total();
+
+  // Queues
+  qCmd     = xQueueCreate(1, sizeof(CmdFrame));
+  qControl = xQueueCreate(1, sizeof(ControlOut));
+  qTlm     = xQueueCreate(1, sizeof(TelemetryOp22::Frame22));
+
+  // Tasks
+  xTaskCreatePinnedToCore(Task_Comm_50ms, "comm50", 4096, nullptr, 2, nullptr, CORE0);
+  xTaskCreatePinnedToCore(Task_PID_10ms,  "pid10",  4096, nullptr, 3, nullptr, CORE0);
+  xTaskCreatePinnedToCore(Task_Sensors,   "sens",   4096, nullptr, 2, nullptr, CORE0);
+
+  xTaskCreatePinnedToCore(Task_Motor,     "motor",  4096, nullptr, 4, nullptr, CORE1);
+  xTaskCreatePinnedToCore(Task_UltraKick, "ukick",  2048, nullptr, 1, nullptr, CORE1);
+
+  Serial.println("[APP] Tasks created");
+}
+
+void App_loop()
+{
+  vTaskDelay(pdMS_TO_TICKS(1));
+}

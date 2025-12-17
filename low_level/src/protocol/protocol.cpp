@@ -1,233 +1,140 @@
-// ======================= protocol.cpp (IF/ELSE ONLY, CONSISTENT LITTLE-ENDIAN) =======================
-
-#include "protocol.hpp"
+#pragma once
+#include <stdint.h>
 
 namespace Protocol {
 
-static inline bool readU8(Network& net, uint8_t& v) { return net.getUint8(v); }
-static inline bool readN(Network& net, uint8_t* buf, size_t n) { return net.getArrayUint8(buf, n); }
+  // ===================== CMD LIST (ESP32) =====================
+  enum class Cmd : uint8_t {
+    CMD_GLOBAL_OPERATION       = 0xFF,
+    CMD_GLOBAL_IDLE            = 0xFE,
+    CMD_GLOBAL_PING_MODE       = 0xFD,
+    CMD_GLOBAL_EMRGENCY_STOP   = 0xF0,
 
-static inline void clearIdlePayload(IdleCmd& out) {
-    out.len = 0;
-    memset(out.data, 0, sizeof(out.data));
-}
+    // OPERATION
+    CMD_OP_PWM_FWD = 0xEF,
+    CMD_OP_PWM_BWD = 0xEE,
+    CMD_OP_SPD_FWD = 0xED,
+    CMD_OP_SPD_BWD = 0xEC,
+    CMD_OP_BRAKE   = 0xEB,
 
-bool isIdleCmd(uint8_t c, uint8_t& len) {
-    len = 0;
+    // IDLE sensors
+    CMD_IDLE_SENSOR_LINE_READ  = 0xDF,
+    CMD_IDLE_SENSOR_ULTRA_READ = 0xDE,
+    CMD_IDLE_SENSOR_ULTRA_KICK = 0xDD,
+    CMD_IDLE_SENSOR_MPU_READ   = 0xDC,
+    CMD_IDLE_ENCODER_ENABLE    = 0xDB,
+    CMD_IDLE_ENCODER_DISABLE   = 0xDA,
 
-    // -------- Len = 0 --------
-    if (c == (uint8_t)Cmd::CMD_IDLE_SENSOR_LINE_READ  ||
-        c == (uint8_t)Cmd::CMD_IDLE_SENSOR_ULTRA_READ ||
-        c == (uint8_t)Cmd::CMD_IDLE_SENSOR_ULTRA_KICK ||
-        c == (uint8_t)Cmd::CMD_IDLE_SENSOR_MPU_READ   ||
-        c == (uint8_t)Cmd::CMD_IDLE_ENCODER_ENABLE    ||
-        c == (uint8_t)Cmd::CMD_IDLE_ENCODER_DISABLE   ||
-        c == (uint8_t)Cmd::CMD_IDLE_ACTUATOR_MOTOR_ENABLE  ||
-        c == (uint8_t)Cmd::CMD_IDLE_ACTUATOR_MOTOR_DISABLE ||
-        c == (uint8_t)Cmd::CMD_IDLE_ACTUATOR_MOTOR_STOP    ||
-        c == (uint8_t)Cmd::CMD_IDLE_ACTUATOR_SERVO_ENABLE  ||
-        c == (uint8_t)Cmd::CMD_IDLE_ACTUATOR_SERVO_DISABLE ||
-        c == (uint8_t)Cmd::CMD_IDLE_ACTUATOR_SERVO_READ    ||
-        c == (uint8_t)Cmd::CMD_IDLE_ACTUATOR_SERVO_WRITE_CENTER)
-    {
-        len = 0;
-        return true;
+    // IDLE actuators
+    CMD_IDLE_ACTUATOR_MOTOR_ENABLE      = 0xCF,
+    CMD_IDLE_ACTUATOR_MOTOR_DISABLE     = 0xCE,
+    CMD_IDLE_ACTUATOR_MOTOR_PWM_FWD     = 0xCD,
+    CMD_IDLE_ACTUATOR_MOTOR_PWM_BWD     = 0xCC,
+    CMD_IDLE_ACTUATOR_MOTOR_SPD_FWD     = 0xCB,
+    CMD_IDLE_ACTUATOR_MOTOR_SPD_BWD     = 0xCA,
+    CMD_IDLE_ACTUATOR_MOTOR_STOP        = 0xC9,
+
+    CMD_IDLE_ACTUATOR_SERVO_ENABLE       = 0xC8,
+    CMD_IDLE_ACTUATOR_SERVO_DISABLE      = 0xC7,
+    CMD_IDLE_ACTUATOR_SERVO_WRITE        = 0xC6, // payload u16
+    CMD_IDLE_ACTUATOR_SERVO_READ         = 0xC5,
+    CMD_IDLE_ACTUATOR_SERVO_WRITE_CENTER = 0xC4,
+
+    // IDLE set params (payload fixed 30)
+    CMD_IDLE_SET_LINE_PARAMS     = 0xBF,
+    CMD_IDLE_SET_MPU_PARAMS      = 0xBE,
+    CMD_IDLE_SET_ULTRA_PARAMS    = 0xBD,
+    CMD_IDLE_SET_MOTOR_PARAMS    = 0xBC,
+    CMD_IDLE_SET_SERVO_PARAMS    = 0xBB,
+    CMD_IDLE_SET_PID_PARAMS      = 0xBA,
+  };
+
+  // ===================== ACK =====================
+  static constexpr uint8_t ACK_IDLE = 0x20;
+
+  // ===================== GROUP =====================
+  enum class Group : uint8_t { UNKNOWN=0xFF, SYSTEM=0, IDLE=1, OPERATION=2 };
+
+  inline Group groupOf(uint8_t cmd)
+  {
+    // SYSTEM
+    if (cmd == (uint8_t)Cmd::CMD_GLOBAL_OPERATION ||
+        cmd == (uint8_t)Cmd::CMD_GLOBAL_IDLE ||
+        cmd == (uint8_t)Cmd::CMD_GLOBAL_PING_MODE ||
+        cmd == (uint8_t)Cmd::CMD_GLOBAL_EMRGENCY_STOP) {
+      return Group::SYSTEM;
     }
 
-    // -------- Len = 2 --------
-    if (c == (uint8_t)Cmd::CMD_IDLE_ACTUATOR_SERVO_WRITE) {
-        len = 2;
-        return true;
+    // OPERATION
+    if (cmd == (uint8_t)Cmd::CMD_OP_PWM_FWD ||
+        cmd == (uint8_t)Cmd::CMD_OP_PWM_BWD ||
+        cmd == (uint8_t)Cmd::CMD_OP_SPD_FWD ||
+        cmd == (uint8_t)Cmd::CMD_OP_SPD_BWD ||
+        cmd == (uint8_t)Cmd::CMD_OP_BRAKE) {
+      return Group::OPERATION;
     }
 
-    // -------- Len = 30 (set params blocks) --------
-    if (c == (uint8_t)Cmd::CMD_IDLE_SET_LINE_PARAMS  ||
-        c == (uint8_t)Cmd::CMD_IDLE_SET_MPU_PARAMS   ||
-        c == (uint8_t)Cmd::CMD_IDLE_SET_ULTRA_PARAMS ||
-        c == (uint8_t)Cmd::CMD_IDLE_SET_MOTOR_PARAMS ||
-        c == (uint8_t)Cmd::CMD_IDLE_SET_SERVO_PARAMS ||
-        c == (uint8_t)Cmd::CMD_IDLE_SET_PID_PARAMS)
-    {
-        len = 30;
-        return true;
+    // Known IDLE (by explicit list)
+    switch ((Cmd)cmd) {
+      case Cmd::CMD_IDLE_SENSOR_LINE_READ:
+      case Cmd::CMD_IDLE_SENSOR_ULTRA_READ:
+      case Cmd::CMD_IDLE_SENSOR_ULTRA_KICK:
+      case Cmd::CMD_IDLE_SENSOR_MPU_READ:
+      case Cmd::CMD_IDLE_ENCODER_ENABLE:
+      case Cmd::CMD_IDLE_ENCODER_DISABLE:
+      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_ENABLE:
+      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_DISABLE:
+      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_PWM_FWD:
+      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_PWM_BWD:
+      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_SPD_FWD:
+      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_SPD_BWD:
+      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_STOP:
+      case Cmd::CMD_IDLE_ACTUATOR_SERVO_ENABLE:
+      case Cmd::CMD_IDLE_ACTUATOR_SERVO_DISABLE:
+      case Cmd::CMD_IDLE_ACTUATOR_SERVO_WRITE:
+      case Cmd::CMD_IDLE_ACTUATOR_SERVO_READ:
+      case Cmd::CMD_IDLE_ACTUATOR_SERVO_WRITE_CENTER:
+      case Cmd::CMD_IDLE_SET_LINE_PARAMS:
+      case Cmd::CMD_IDLE_SET_MPU_PARAMS:
+      case Cmd::CMD_IDLE_SET_ULTRA_PARAMS:
+      case Cmd::CMD_IDLE_SET_MOTOR_PARAMS:
+      case Cmd::CMD_IDLE_SET_SERVO_PARAMS:
+      case Cmd::CMD_IDLE_SET_PID_PARAMS:
+        return Group::IDLE;
+      default:
+        return Group::UNKNOWN;
     }
+  }
 
-    // -------- Optional: enable these only if you really send payload in IDLE for motor --------
-    // if (c == (uint8_t)Cmd::CMD_IDLE_ACTUATOR_MOTOR_PWM_FWD ||
-    //     c == (uint8_t)Cmd::CMD_IDLE_ACTUATOR_MOTOR_PWM_BWD)
-    // {
-    //     len = 2; // pwm_u16
-    //     return true;
-    // }
-    //
-    // if (c == (uint8_t)Cmd::CMD_IDLE_ACTUATOR_MOTOR_SPD_FWD ||
-    //     c == (uint8_t)Cmd::CMD_IDLE_ACTUATOR_MOTOR_SPD_BWD)
-    // {
-    //     len = 4; // speed_f32
-    //     return true;
-    // }
+  // ===================== PAYLOAD LENGTH =====================
+  // return: 0, 2, or 30
+  inline uint8_t payloadLen(uint8_t cmd)
+  {
+    switch ((Cmd)cmd) {
+      // u16 payload (LE)
+      case Cmd::CMD_OP_PWM_FWD:
+      case Cmd::CMD_OP_PWM_BWD:
+      case Cmd::CMD_OP_SPD_FWD:
+      case Cmd::CMD_OP_SPD_BWD:
+      case Cmd::CMD_IDLE_ACTUATOR_SERVO_WRITE:
+      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_PWM_FWD:
+      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_PWM_BWD:
+      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_SPD_FWD:
+      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_SPD_BWD:
+        return 2;
 
-    return false;
-}
+      // 30-byte params
+      case Cmd::CMD_IDLE_SET_LINE_PARAMS:
+      case Cmd::CMD_IDLE_SET_MPU_PARAMS:
+      case Cmd::CMD_IDLE_SET_ULTRA_PARAMS:
+      case Cmd::CMD_IDLE_SET_MOTOR_PARAMS:
+      case Cmd::CMD_IDLE_SET_SERVO_PARAMS:
+      case Cmd::CMD_IDLE_SET_PID_PARAMS:
+        return 30;
 
-bool isOperationCmd(uint8_t c, uint8_t& len) {
-    len = 0;
-
-    if (c == (uint8_t)Cmd::CMD_OP_PWM_FWD ||
-        c == (uint8_t)Cmd::CMD_OP_PWM_BWD ||
-        c == (uint8_t)Cmd::CMD_OP_SPD_FWD ||
-        c == (uint8_t)Cmd::CMD_OP_SPD_BWD)
-    {
-        len = 6; // value(4) + angle(2)
-        return true;
+      default:
+        return 0;
     }
-
-    if (c == (uint8_t)Cmd::CMD_OP_BRAKE) {
-        len = 0;
-        return true;
-    }
-
-    return false;
-}
-
-static inline void decodeIdleParams(IdleCmd& out) {
-    // Uses if/else only.
-    const uint8_t* p = out.data;
-    const uint8_t cmd = out.cmd;
-
-    // LINE params
-    if (cmd == (uint8_t)Cmd::CMD_IDLE_SET_LINE_PARAMS) {
-        if (out.len >= 6) {
-            out.line_sample_ms = u16_le(p + 0);
-            out.line_threshold = u16_le(p + 2);
-            out.line_reserved0 = u16_le(p + 4);
-        }
-        return;
-    }
-
-    // MPU params
-    if (cmd == (uint8_t)Cmd::CMD_IDLE_SET_MPU_PARAMS) {
-        if (out.len >= 14) {
-            out.mpu_sample_rate_hz = u16_le(p + 0);
-            out.mpu_bias_ax = f32_le(p + 2);
-            out.mpu_bias_ay = f32_le(p + 6);
-            out.mpu_bias_az = f32_le(p + 10);
-        }
-        return;
-    }
-
-    // ULTRA params
-    if (cmd == (uint8_t)Cmd::CMD_IDLE_SET_ULTRA_PARAMS) {
-        if (out.len >= 6) {
-            out.ultra_kick_period_ms = u16_le(p + 0);
-            out.ultra_timeout_ms     = u16_le(p + 2);
-            out.ultra_reserved0      = u16_le(p + 4);
-        }
-        return;
-    }
-
-    // MOTOR params
-    if (cmd == (uint8_t)Cmd::CMD_IDLE_SET_MOTOR_PARAMS) {
-        if (out.len >= 8) {
-            out.motor_pwm_freq_hz = u16_le(p + 0);
-            out.motor_pwm_max     = u16_le(p + 2);
-            out.motor_ff          = f32_le(p + 4);
-        }
-        return;
-    }
-
-    // SERVO params
-    if (cmd == (uint8_t)Cmd::CMD_IDLE_SET_SERVO_PARAMS) {
-        if (out.len >= 6) {
-            out.servo_center = u16_le(p + 0);
-            out.servo_min    = u16_le(p + 2);
-            out.servo_max    = u16_le(p + 4);
-        }
-        return;
-    }
-
-    // PID params
-    if (cmd == (uint8_t)Cmd::CMD_IDLE_SET_PID_PARAMS) {
-        if (out.len >= 16) {
-            out.motor_kp     = f32_le(p + 0);
-            out.motor_ki     = f32_le(p + 4);
-            out.motor_kd     = f32_le(p + 8);
-            out.motor_windup = f32_le(p + 12);
-        }
-        return;
-    }
-}
-
-RxResult poll(Network& net, Mode currentMode) {
-    RxResult r;
-    r.ok = false;
-    r.mode = currentMode;
-    r.flag_cmd = 0;
-
-    uint8_t cmd;
-    if (!readU8(net, cmd)) return r;
-
-    r.flag_cmd = cmd;
-
-    // Apply mode switch (no payload)
-    if (cmd == (uint8_t)Cmd::CMD_GLOBAL_OPERATION) r.mode = Mode::OPERATION;
-    else if (cmd == (uint8_t)Cmd::CMD_GLOBAL_IDLE) r.mode = Mode::IDLE;
-
-    // System cmd: done
-    if (isSystemCmd(cmd)) {
-        r.ok = true;
-        return r;
-    }
-
-    // OPERATION mode parse
-    if (r.mode == Mode::OPERATION) {
-        r.op.cmd = cmd;
-
-        uint8_t need = 0;
-        if (isOperationCmd(cmd, need) && need > 0) {
-            uint8_t buf[6];
-            if (!readN(net, buf, sizeof(buf))) return r;
-
-            r.op.angle = u16_le(&buf[4]);
-
-            if (cmd == (uint8_t)Cmd::CMD_OP_PWM_FWD || cmd == (uint8_t)Cmd::CMD_OP_PWM_BWD) {
-                r.op.pwm = u16_le(&buf[0]); // buf[2..3] reserved
-            } else if (cmd == (uint8_t)Cmd::CMD_OP_SPD_FWD || cmd == (uint8_t)Cmd::CMD_OP_SPD_BWD) {
-                r.op.speed = f32_le(&buf[0]);
-            }
-        }
-
-        r.ok = true;
-        return r;
-    }
-
-    // IDLE mode parse
-    if (r.mode == Mode::IDLE) {
-        r.idle.cmd = cmd;
-        clearIdlePayload(r.idle);
-
-        uint8_t need = 0;
-        if (isIdleCmd(cmd, need) && need > 0) {
-            if (need > sizeof(r.idle.data)) return r;
-            if (!readN(net, r.idle.data, need)) return r;
-            r.idle.len = need;
-
-            // decode set-params into typed fields
-            decodeIdleParams(r.idle);
-
-            // also decode simple 2-byte servo write into typed fields if you want:
-            // (kept raw here; App can parse from data[] if needed)
-        } else {
-            r.idle.len = 0;
-        }
-
-        r.ok = true;
-        return r;
-    }
-
-    // fallback
-    r.ok = true;
-    return r;
-}
+  }
 
 } // namespace Protocol

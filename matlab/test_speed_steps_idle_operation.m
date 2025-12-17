@@ -21,7 +21,7 @@ function test_speed_steps_idle_operation()
 %   If your recvSensorFrame() signature differs, adjust parsing section only.
 
     %% ===== USER PARAMETERS =====
-    btName    = "Behind the scream";
+    btName    = "Behind the scream122";
     btChannel = 1;
 
     speedSteps = [30, 60, 100];   % percent

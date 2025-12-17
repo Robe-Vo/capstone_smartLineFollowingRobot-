@@ -143,7 +143,15 @@ void IRAM_ATTR hanlder_ultra_echo()
     }
 }
 
+void ultra_setHigh()
+{
+    digitalWrite(ultra_trig_pin, HIGH);
+}
 
+void ultra_setLow()
+{
+    digitalWrite(ultra_trig_pin, LOW);
+}
 
 /**
  * Return distance in cm (0 if no new measurement)

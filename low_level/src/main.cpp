@@ -1,18 +1,10 @@
-// ======================= main.cpp =======================
-
-// Include necessary headers
-#include <Arduino.h>    
+#include <Arduino.h>
 #include "app/app.hpp"
 
-
-void setup()
-{
-
+void setup() {
+  App_setup();
 }
 
-
-void loop()
-{
-
+void loop() {
+  App_loop();
 }
-

@@ -1,6 +1,13 @@
 #pragma once
 #include <stdint.h>
 
-#include "protocol/protocol.hpp"
-#include "control/control.hpp"
-#include "telemetry/telemetry.hpp"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void App_setup();
+void App_loop();
+
+#ifdef __cplusplus
+}
+#endif

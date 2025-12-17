@@ -12,6 +12,8 @@ uint8_t* line_readSignals(); // get ră uint8 signals
 /* Ultra-sonics sensor */
 void ultra_setup(uint8_t ULTRA_TRIG_PIN,uint8_t ULTRA_ECHO_PIN);
 void ultra_kick();
+void ultra_setHigh();
+void ultra_setLow();
 void IRAM_ATTR hanlder_ultra_echo();
 uint16_t ultra_getSignal();
 
