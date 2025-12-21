@@ -2,9 +2,11 @@
 #include <Arduino.h>
 #include "dispatch.hpp"
 
-
-
-
+/**
+ *          ===== OPERATION HANDLERS =====
+ * 
+ *  Set flag and storage data whenever they are called
+ */
 namespace SystemHandlers
 {
   void to_idle(const Protocol::RxFrame& f);
