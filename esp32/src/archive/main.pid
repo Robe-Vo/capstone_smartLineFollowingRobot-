@@ -1,0 +1,195 @@
+// ======================= main.cpp (PID SPEED LOOP TEST + DEBUG) =======================
+// Notes:
+// - This main uses your Controller library + Encoder + Drive
+// - Adds full debug line including encoder raw/iir/out + mode + count_dt
+// - NO servo calls
+
+#include <Arduino.h>
+
+#include "actuators.hpp"   // Drive::setup, Drive::setPWM(duty,dir)
+#include "encoder.hpp"       // Encoder::...
+#include "controller.hpp"            // Controller::...
+
+#ifndef TS_CTRL_MS
+#define TS_CTRL_MS                 10
+#endif
+
+#ifndef TEST_STEP_HZ_1
+#define TEST_STEP_HZ_1             5.0f
+#endif
+#ifndef TEST_STEP_HZ_2
+#define TEST_STEP_HZ_2             10.0f
+#endif
+#ifndef TEST_HOLD_MS
+#define TEST_HOLD_MS               4000
+#endif
+#ifndef TEST_STOP_MS
+#define TEST_STOP_MS               3000
+#endif
+
+#ifndef SPEED_OK_BAND_HZ
+#define SPEED_OK_BAND_HZ           0.5f
+#endif
+#ifndef SPEED_OK_TIME_MS
+#define SPEED_OK_TIME_MS           1000
+#endif
+
+static const bool DIR_FWD = true;
+
+// ======= Controller config (assign fields; no brace ctor) =======
+static Controller::Cfg   gCfg;
+static Controller::State gSt;
+static Controller::Debug gDbg;
+
+static void cfg_init()
+{
+  gCfg.kp = 30.0f;
+  gCfg.ki = 80.0f;
+  gCfg.kd = 0.0f;
+
+  gCfg.d_tau_s = 0.02f;
+  gCfg.i_limit = 600.0f;
+
+  gCfg.out_min = 0;
+  gCfg.out_max = 2047;
+
+  gCfg.deadband = 120;
+  gCfg.out_slew_per_s = 4000.0f;
+}
+
+// ======= Test state machine =======
+enum class TestPhase : uint8_t { IDLE0=0, STEP1, STEP2, STOP };
+static TestPhase gPhase = TestPhase::IDLE0;
+
+static float gRefHz = 0.0f;
+static uint32_t gPhaseT0 = 0;
+static uint32_t gLastCtrl = 0;
+
+// Settling detector
+static uint32_t gInBandT0 = 0;
+static bool gInBand = false;
+
+static void apply_motor(uint16_t duty, bool dir)
+{
+  Drive::setPWM((int16_t)duty, dir);
+}
+
+static void set_ref(float hz)
+{
+  gRefHz = (hz < 0.0f) ? 0.0f : hz;
+
+  // Optional: reset on stop
+  if (gRefHz < 0.001f) {
+    Controller::reset(gSt);
+  }
+}
+
+static void change_phase(TestPhase ph)
+{
+  gPhase = ph;
+  gPhaseT0 = millis();
+  gInBand = false;
+  gInBandT0 = 0;
+
+  switch (gPhase) {
+    case TestPhase::IDLE0: set_ref(0.0f); break;
+    case TestPhase::STEP1: set_ref(TEST_STEP_HZ_1); break;
+    case TestPhase::STEP2: set_ref(TEST_STEP_HZ_2); break;
+    case TestPhase::STOP:  set_ref(0.0f); break;
+  }
+
+  Serial.printf("\n=== PHASE %d: ref=%.2f Hz ===\n", (int)gPhase, (double)gRefHz);
+}
+
+static void ctrl_tick()
+{
+  const float dt_s = (float)TS_CTRL_MS / 1000.0f;
+
+  // Update encoder
+  Encoder::calculate_vec(TS_CTRL_MS);
+
+  const float meas_hz = fabsf(Encoder::get_vec_hz());
+
+  // PID
+  uint16_t duty = Controller::update(gSt, gCfg, gRefHz, meas_hz, dt_s, &gDbg);
+
+  // Apply motor
+  if (gRefHz < 0.001f) apply_motor(0, DIR_FWD);
+  else                 apply_motor(duty, DIR_FWD);
+
+  // Encoder debug snapshot
+  const int8_t cnt_dt = Encoder::get_count();
+  const float raw_hz  = Encoder::get_raw_vec_hz();
+  const float iir_hz  = Encoder::get_iir_vec_hz();
+  const float out_hz  = Encoder::get_vec_hz();
+  const uint8_t mode  = (uint8_t)Encoder::get_mode(); // 0 period_B, 1 acc_AB
+
+  // FULL DEBUG LINE (this is the one you use to diagnose closed-loop)
+  Serial.printf("[PID] ref=%.2f meas=%.2f err=%.2f duty=%u  P=%.1f I=%.1f D=%.1f | ENC raw=%.2f iir=%.2f out=%.2f mode=%u cnt=%d\n",
+                (double)gRefHz, (double)meas_hz, (double)gDbg.err, (unsigned)gDbg.duty_out,
+                (double)gDbg.p, (double)gDbg.i, (double)gDbg.d,
+                (double)raw_hz, (double)iir_hz, (double)out_hz, (unsigned)mode, (int)cnt_dt);
+
+  // Settling detect
+  float eabs = fabsf(gRefHz - meas_hz);
+  bool in_band_now = (gRefHz < 0.001f) ? (meas_hz < SPEED_OK_BAND_HZ) : (eabs <= SPEED_OK_BAND_HZ);
+
+  if (in_band_now) {
+    if (!gInBand) {
+      gInBand = true;
+      gInBandT0 = millis();
+    } else if ((millis() - gInBandT0) >= SPEED_OK_TIME_MS) {
+      Serial.printf(">>> OK: settled within ±%.2f Hz for %u ms\n",
+                    (double)SPEED_OK_BAND_HZ, (unsigned)SPEED_OK_TIME_MS);
+      gInBandT0 = millis() + 1000000UL; // prevent spam
+    }
+  } else {
+    gInBand = false;
+  }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(200);
+
+  Drive::setup();
+  Encoder::setup();
+
+  cfg_init();
+  Controller::init(gSt, gCfg);
+
+  apply_motor(0, DIR_FWD);
+
+  Serial.println("=== PID SPEED LOOP TEST + DEBUG ===");
+  Serial.println("Expect: meas rises toward ref, err decreases, duty not stuck, encoder raw/iir/out change with duty.");
+
+  gLastCtrl = millis();
+  change_phase(TestPhase::IDLE0);
+}
+
+void loop()
+{
+  const uint32_t now = millis();
+
+  if ((now - gLastCtrl) >= (uint32_t)TS_CTRL_MS) {
+    gLastCtrl += TS_CTRL_MS;
+    ctrl_tick();
+  }
+
+  const uint32_t t = now - gPhaseT0;
+  switch (gPhase) {
+    case TestPhase::IDLE0:
+      if (t >= 2000) change_phase(TestPhase::STEP1);
+      break;
+    case TestPhase::STEP1:
+      if (t >= TEST_HOLD_MS) change_phase(TestPhase::STEP2);
+      break;
+    case TestPhase::STEP2:
+      if (t >= TEST_HOLD_MS) change_phase(TestPhase::STOP);
+      break;
+    case TestPhase::STOP:
+      if (t >= TEST_STOP_MS) change_phase(TestPhase::STEP1); // repeat
+      break;
+  }
+}

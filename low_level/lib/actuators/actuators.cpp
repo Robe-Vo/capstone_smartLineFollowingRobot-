@@ -1,51 +1,52 @@
+// esp32/lib/actuators/actuators.cpp
 #include "actuators.hpp"
 #include <math.h>
 
+#include "../../include/cfg.hpp"
+#include "../../include/pin.hpp"
+
+// ======================= ENCODER (Hybrid: Period + Accumulate) =======================
+
 namespace Encoder {
 
-/* ======================= ENCODER SHARED STATE ======================= */
 portMUX_TYPE mux_enc = portMUX_INITIALIZER_UNLOCKED;
 
-static volatile int32_t  encoder_pulse_total = 0;
-static volatile int32_t  encoder_pulse_accum = 0;
-
-static volatile uint8_t  enc_prev_state = 0;
-static volatile int8_t   encoder_direction = +1;
-
-static volatile uint32_t enc_last_edge_us  = 0;
-static volatile uint32_t enc_period_us     = 0;
-static volatile uint32_t enc_last_pulse_ms = 0;
-
+// ISR shared state
 static uint8_t  PIN_A = 0;
 static uint8_t  PIN_B = 0;
-static uint16_t ENCODER_PPR_EFFECTIVE = 1;
 
-static HybridConfig HC{};
+static volatile int32_t  encoder_pulse_total = 0;
+static volatile int32_t  encoder_pulse_accum = 0;     // accumulate delta for hybrid
+static volatile int8_t   encoder_direction   = 0;
 
-/* ======================= FILTER / HYBRID STATE ======================= */
+static volatile uint32_t enc_last_edge_us    = 0;
+static volatile uint32_t enc_period_us       = 0;
+static volatile uint32_t enc_last_pulse_ms   = 0;
+static volatile uint8_t  enc_prev_state      = 0;
+
+// Effective PPR used by accumulate conversion
+static uint16_t ENCODER_PPR_EFFECTIVE = ENC_EFFECTIVE_PPR;
+
+// Runtime hybrid config
+static HybridConfig HC;
+
+// Outputs
 static float f_raw_period_hz = 0.0f;
 static float f_raw_accum_hz  = 0.0f;
 static float f_hybrid_hz     = 0.0f;
 static float f_iir_hz        = 0.0f;
 static float f_out_hz        = 0.0f;
 
-static float rpm_dummy = 0.0f;
-
-/* ======================= Helpers ======================= */
+// ---------- helpers ----------
 static inline float clampf(float x, float lo, float hi) {
   if (x < lo) return lo;
   if (x > hi) return hi;
   return x;
 }
 
-static inline float alpha_adaptive(float dt_s) {
-  float a = 1.0f - expf(-dt_s / HC.tau_iir_s);
-  return clampf(a, HC.alpha_min, HC.alpha_max);
-}
-
-static inline float smoothstep(float x) {
-  x = clampf(x, 0.0f, 1.0f);
-  return x * x * (3.0f - 2.0f * x);
+static inline float smoothstep(float t) {
+  t = clampf(t, 0.0f, 1.0f);
+  return t * t * (3.0f - 2.0f * t);
 }
 
 static inline float blend_weight(float f_pred_hz) {
@@ -65,10 +66,15 @@ static inline bool soft_dt_ok(uint32_t dt_us, float f_pred_hz) {
 
 static inline float hard_clamp_period_hz(float f_hz) {
   float f_max_from_Tw = 1.0f / HC.Tw_min_s;
-  float f_min_from_Tw = 1.0f / HC.Tw_max_s;
-  f_hz = clampf(f_hz, f_min_from_Tw, f_max_from_Tw);
+  f_hz = clampf(f_hz, 0.0f, f_max_from_Tw);
   f_hz = clampf(f_hz, 0.0f, HC.f_hard_max_hz);
   return f_hz;
+}
+
+static inline float alpha_adaptive(float dt_s) {
+  float a = dt_s / (HC.tau_iir_s + dt_s);
+  a = clampf(a, HC.alpha_min, HC.alpha_max);
+  return a;
 }
 
 static inline float zero_speed_logic(float v_hz, float dt_s, float t_since_pulse_s) {
@@ -90,14 +96,24 @@ static inline float jerk_limit(float prev, float x, float dt_s) {
   return prev + d;
 }
 
-/* ======================= API ======================= */
+// ======================= API =======================
+
 void speed_filter_init() {
   f_raw_period_hz = 0.0f;
   f_raw_accum_hz  = 0.0f;
   f_hybrid_hz     = 0.0f;
   f_iir_hz        = 0.0f;
   f_out_hz        = 0.0f;
-  rpm_dummy       = 0.0f;
+
+  portENTER_CRITICAL(&mux_enc);
+  encoder_pulse_total = 0;
+  encoder_pulse_accum = 0;
+  encoder_direction   = 0;
+  enc_last_edge_us    = 0;
+  enc_period_us       = 0;
+  enc_last_pulse_ms   = (uint32_t)(esp_timer_get_time() / 1000u);
+  enc_prev_state      = 0;
+  portEXIT_CRITICAL(&mux_enc);
 }
 
 void speed_filter_config(uint8_t mode, uint16_t a_raw, uint16_t b_raw) {
@@ -108,77 +124,69 @@ void encoder_begin(uint8_t pinA, uint8_t pinB, uint16_t ppr_effective, const Hyb
   PIN_A = pinA;
   PIN_B = pinB;
   ENCODER_PPR_EFFECTIVE = (ppr_effective == 0) ? 1 : ppr_effective;
+
   HC = cfg;
 
   pinMode(PIN_A, INPUT_PULLUP);
   pinMode(PIN_B, INPUT_PULLUP);
 
-  uint8_t a0 = digitalRead(PIN_A) ? 1 : 0;
-  uint8_t b0 = digitalRead(PIN_B) ? 1 : 0;
-  enc_prev_state = (a0 << 1) | b0;
-
-  uint32_t now_us = (uint32_t)esp_timer_get_time();
-  portENTER_CRITICAL(&mux_enc);
-  encoder_pulse_total = 0;
-  encoder_pulse_accum = 0;
-  encoder_direction   = +1;
-  enc_last_edge_us    = now_us;
-  enc_period_us       = 0;
-  enc_last_pulse_ms   = (uint32_t)(now_us / 1000u);
-  portEXIT_CRITICAL(&mux_enc);
+  // init prev state
+  uint8_t a = gpio_get_level((gpio_num_t)PIN_A) ? 1 : 0;
+  uint8_t b = gpio_get_level((gpio_num_t)PIN_B) ? 1 : 0;
+  enc_prev_state = (a << 1) | b;
 
   attachInterrupt(digitalPinToInterrupt(PIN_A), isr_encoder_AB, CHANGE);
   attachInterrupt(digitalPinToInterrupt(PIN_B), isr_encoder_AB, CHANGE);
+
+  speed_filter_init();
 }
 
-void speed_filter_update(float raw) { rpm_dummy = raw; }
+void speed_filter_update(float raw) { (void)raw; }
 
+// -------------------- Accessors --------------------
 float speed_get_hz_raw_period() { return f_raw_period_hz; }
-float speed_get_hz_raw_accum()  { return f_raw_accum_hz;  }
-float speed_get_hz_hybrid()     { return f_hybrid_hz;     }
-float speed_get_hz_iir()        { return f_iir_hz;        }
-float speed_get_hz_out()        { return f_out_hz;        }
+float speed_get_hz_raw_accum()  { return f_raw_accum_hz; }
+float speed_get_hz_hybrid()     { return f_hybrid_hz; }
+float speed_get_hz_iir()        { return f_iir_hz; }
+float speed_get_hz_out()        { return f_out_hz; }
 
 int32_t encoder_get_total() {
-  int32_t v;
   portENTER_CRITICAL(&mux_enc);
-  v = encoder_pulse_total;
+  int32_t v = encoder_pulse_total;
   portEXIT_CRITICAL(&mux_enc);
   return v;
 }
 
 int8_t encoder_get_dir() {
-  int8_t d;
   portENTER_CRITICAL(&mux_enc);
-  d = encoder_direction;
+  int8_t v = encoder_direction;
   portEXIT_CRITICAL(&mux_enc);
-  return d;
+  return v;
 }
 
 uint32_t encoder_get_period_us() {
-  uint32_t T;
   portENTER_CRITICAL(&mux_enc);
-  T = enc_period_us;
+  uint32_t v = enc_period_us;
   portEXIT_CRITICAL(&mux_enc);
-  return T;
+  return v;
 }
 
 uint32_t encoder_get_last_pulse_ms() {
-  uint32_t t;
   portENTER_CRITICAL(&mux_enc);
-  t = enc_last_pulse_ms;
+  uint32_t v = enc_last_pulse_ms;
   portEXIT_CRITICAL(&mux_enc);
-  return t;
+  return v;
 }
 
 int32_t encoder_snapshot_delta_and_reset_accum() {
-  int32_t d;
   portENTER_CRITICAL(&mux_enc);
-  d = encoder_pulse_accum;
+  int32_t d = encoder_pulse_accum;
   encoder_pulse_accum = 0;
   portEXIT_CRITICAL(&mux_enc);
   return d;
 }
+
+// ======================= HYBRID UPDATE =======================
 
 void hybrid_update(float dt_s) {
   // Snapshot ISR values
@@ -202,8 +210,9 @@ void hybrid_update(float dt_s) {
     // accept only if pulse is not too old relative to now_ms
     uint32_t age_ms = now_ms - last_ms;
     if (age_ms <= (uint32_t)(HC.Tmin_zero_s * 1000.0f + 200.0f)) {
-      fP = 1.0e6f / (float)T_us;
-      if (dir < 0) fP = -fP;
+      float fP_edge  = 1.0e6f / (float)T_us;                      // edge/s
+      float fP_wheel = fP_edge / (float)(ENC_RESOLUTION * 2.0f);  // wheel Hz
+      fP = (dir < 0) ? -fP_wheel : +fP_wheel;
       period_valid = true;
     }
   }
@@ -221,7 +230,7 @@ void hybrid_update(float dt_s) {
 
   // ---------- Accumulate path (Hz) ----------
   int32_t dcount = encoder_snapshot_delta_and_reset_accum();
-  float fA = (dt_s > 1e-6f) ? ((float)dcount / dt_s) : 0.0f;
+  float fA = (dt_s > 1e-6f) ? ((float)dcount / (dt_s * (float)ENCODER_PPR_EFFECTIVE)) : 0.0f;
   f_raw_accum_hz = fA;
 
   float fA_abs = fabsf(fA);
@@ -249,51 +258,72 @@ void hybrid_update(float dt_s) {
 }
 
 /* ======================= ENCODER ISR (quadrature + period) ======================= */
-void IRAM_ATTR isr_encoder_AB() {
-  uint32_t now_us = (uint32_t)esp_timer_get_time();
 
-  uint8_t a = gpio_get_level((gpio_num_t)PIN_A) ? 1 : 0;
-  uint8_t b = gpio_get_level((gpio_num_t)PIN_B) ? 1 : 0;
-  uint8_t newState = (a << 1) | b;
+  void IRAM_ATTR isr_encoder_AB()
+  {
+    // Chỉ đo encoder khi đang OPERATION để tránh nhiễu khi IDLE
+    if (!State::isOperation()) {
+      return;
+    }
 
-  static const int8_t quad_table[4][4] = {
-      {  0, +1, -1,  0 },
-      { -1,  0,  0, +1 },
-      { +1,  0,  0, -1 },
-      {  0, -1, +1,  0 }
-  };
+    uint32_t now_us = (uint32_t)esp_timer_get_time();
 
-  uint8_t oldState = enc_prev_state & 0x03;
-  int8_t step = quad_table[oldState][newState & 0x03];
-  enc_prev_state = newState;
+    uint8_t a = gpio_get_level((gpio_num_t)PIN_A) ? 1 : 0;
+    uint8_t b = gpio_get_level((gpio_num_t)PIN_B) ? 1 : 0;
+    uint8_t newState = (a << 1) | b;
 
-  if (step == 0) return;
+    static const int8_t quad_table[4][4] = {
+        {  0, +1, -1,  0 },
+        { -1,  0,  0, +1 },
+        { +1,  0,  0, -1 },
+        {  0, -1, +1,  0 }
+    };
 
-  uint32_t dt = now_us - enc_last_edge_us;
-  enc_last_edge_us = now_us;
+    uint8_t oldState = enc_prev_state & 0x03;
+    int8_t step = quad_table[oldState][newState & 0x03];
+    enc_prev_state = newState;
 
-  // reject too-fast glitch
-  if (dt <= 50) return;
+    if (step == 0) return;
 
-  portENTER_CRITICAL_ISR(&mux_enc);
-  encoder_pulse_total += step;
-  encoder_pulse_accum += step;
-  encoder_direction   = (step > 0) ? +1 : -1;
-  enc_period_us       = dt;
-  enc_last_pulse_ms   = (uint32_t)(now_us / 1000u);
-  portEXIT_CRITICAL_ISR(&mux_enc);
-}
+    // ===== Accumulate: dùng cả A và B (x4) =====
+    portENTER_CRITICAL_ISR(&mux_enc);
+    encoder_pulse_total += step;
+    encoder_pulse_accum += step;
+    encoder_direction   = (step > 0) ? +1 : -1;
+    portEXIT_CRITICAL_ISR(&mux_enc);
+
+    // ===== Period: chỉ sử dụng cạnh ở channel B =====
+    // Bit0 là B, nếu B không đổi -> không cập nhật period
+    if (((oldState ^ newState) & 0x01u) == 0u) {
+      return;
+    }
+
+    uint32_t dt = now_us - enc_last_edge_us;
+    enc_last_edge_us = now_us;
+
+    // loại glitch quá nhanh
+    if (dt < 50u) {
+      return;
+    }
+
+    portENTER_CRITICAL_ISR(&mux_enc);
+    enc_period_us = dt;
+    enc_last_pulse_ms = (uint32_t)(now_us / 1000u);
+    portEXIT_CRITICAL_ISR(&mux_enc);
+  }
 
 } // namespace Encoder
 
-
-/* ======================= MOTOR PWM 11-bit ======================= */
+/* ======================= Motor PWM 11-bit helper ======================= */
 namespace MotorPWM11 {
 
 static uint8_t PWM_PIN = 0;
 static uint8_t OUT1_PIN = 0;
 static uint8_t OUT2_PIN = 0;
 static uint8_t CH = 0;
+
+// Deadband duty (0 disables). Initialized from cfg.hpp.
+static uint16_t s_deadband = MOTOR_DEADBAND_DUTY_DEFAULT;
 
 uint16_t clamp_speed_to_duty(uint16_t speed_u16) {
   // User convention: speed_u16 in 0..2048, saturate at 2048
@@ -330,6 +360,10 @@ void begin(uint8_t pwm_pin, uint8_t out1_pin, uint8_t out2_pin,
 
 void driveForward(uint16_t speed_u16) {
   uint16_t duty = clamp_speed_to_duty(speed_u16);
+
+  if (duty > 0 && duty < s_deadband) duty = s_deadband;
+  if (duty > 2047) duty = 2047;
+
   digitalWrite(OUT1_PIN, HIGH);
   digitalWrite(OUT2_PIN, LOW);
 #if defined(ESP32)
@@ -339,6 +373,10 @@ void driveForward(uint16_t speed_u16) {
 
 void driveBackward(uint16_t speed_u16) {
   uint16_t duty = clamp_speed_to_duty(speed_u16);
+
+  if (duty > 0 && duty < s_deadband) duty = s_deadband;
+  if (duty > 2047) duty = 2047;
+
   digitalWrite(OUT1_PIN, LOW);
   digitalWrite(OUT2_PIN, HIGH);
 #if defined(ESP32)
@@ -353,5 +391,9 @@ void stopMotor() {
   digitalWrite(OUT1_PIN, LOW);
   digitalWrite(OUT2_PIN, LOW);
 }
+
+// Deadband setting
+void setDeadband(uint16_t db) { s_deadband = db; }
+uint16_t getDeadband() { return s_deadband; }
 
 } // namespace MotorPWM11

@@ -1,0 +1,146 @@
+// ======================= test_motor_speed.cpp (NO SERVO) =======================
+// Purpose:
+// - Test reading motor rotational speed using your Encoder library
+// - Control DC motor PWM only (Drive namespace)
+// - Do NOT touch servo (no include/use of Steer functions)
+//
+// What it does:
+// - Ramp duty: 0 -> DUTY_MAX -> 0 (step hold each level)
+// - Every TS_CTRL_MS: call Encoder::calculate_vec()
+// - Print: duty, count_dt, raw speed (Hz), filtered speed (Hz)
+// - Stops motor at end and keeps printing speed (should go to 0)
+//
+// Requirements:
+// - Your Encoder library provides:
+//     Encoder::setup()
+//     Encoder::calculate_vec(uint16_t dt_ms)
+//     Encoder::get_count()
+//     Encoder::get_speed_hz()         (or use global Encoder::vec_hz if you kept it internal; recommended getter)
+//     Encoder::get_speed_raw_hz()
+// - Your Drive library provides:
+//     Drive::setup()
+//     Drive::setPWM(int16_t duty)   // duty signed: +FWD, -BWD, 0 stop
+//
+// If your Encoder library does NOT have get_speed_hz()/get_speed_raw_hz(),
+// add these 2 simple getters in encoder.hpp/cpp.
+
+#include <Arduino.h>
+
+#include "actuators.hpp"   // contains Drive, Steer (we will not call Steer)
+#include "encoder.hpp"       // your encoder library
+
+// ======================= TEST CONFIG (move to cfg.hpp if you want) =======================
+#ifndef TS_CTRL_MS
+#define TS_CTRL_MS                 10     // speed update & log period (ms)
+#endif
+
+#ifndef DUTY_STEP
+#define DUTY_STEP                  200    // duty increment per step (0..2047)
+#endif
+
+#ifndef DUTY_MAX
+#define DUTY_MAX                   1600   // max test duty (<=2047)
+#endif
+
+#ifndef HOLD_MS
+#define HOLD_MS                    1500   // hold time per step (ms)
+#endif
+
+#ifndef TEST_IDLE_MS
+#define TEST_IDLE_MS               2000   // idle time at start/end (ms)
+#endif
+
+// ======================= INTERNALS =======================
+static uint32_t g_t_last = 0;
+static uint32_t g_hold_start = 0;
+
+static int16_t  g_duty = 0;
+static int16_t  g_dir = +1;        // +1 ramp up, -1 ramp down
+static uint32_t g_step_count = 0;
+
+static void log_once()
+{
+  const int8_t c = Encoder::get_count();
+  const float  hz_raw = Encoder::get_raw_vec_hz();
+  const float  hz     = Encoder::get_vec_hz();
+
+  Serial.printf("[TEST] duty=%4d  cnt=%4d  hz_raw=%8.3f  hz=%8.3f\n",
+                (int)g_duty, (int)c, (double)hz_raw, (double)hz);
+}
+
+// ======================= Arduino setup/loop =======================
+void setup()
+{
+  Serial.begin(115200);
+  delay(200);
+
+  // Setup motor + encoder only
+  Drive::setup();
+  Encoder::setup();
+
+  // Ensure motor stop
+  Drive::setPWM(0,true);
+
+  Serial.println("=== MOTOR SPEED TEST (NO SERVO) ===");
+  Serial.println("Format: [TEST] duty cnt hz_raw hz");
+  Serial.println("Start idle...");
+  delay(TEST_IDLE_MS);
+
+  g_t_last = millis();
+  g_hold_start = millis();
+
+  // Start with 0 duty
+  g_duty = 0;
+  g_dir = +1;
+  g_step_count = 0;
+}
+
+void loop()
+{
+  const uint32_t now = millis();
+
+  // Run control update at TS_CTRL_MS
+  if ((now - g_t_last) >= (uint32_t)TS_CTRL_MS) {
+    g_t_last = now;
+
+    // Update speed estimate
+    Encoder::calculate_vec(TS_CTRL_MS);
+
+    // Log
+    log_once();
+  }
+
+  // Step schedule
+  if ((now - g_hold_start) >= (uint32_t)HOLD_MS) {
+    g_hold_start = now;
+    g_step_count++;
+
+    // Update duty ramp
+    if (g_dir > 0) {
+      g_duty += DUTY_STEP;
+      if (g_duty >= DUTY_MAX) {
+        g_duty = DUTY_MAX;
+        g_dir = -1;
+      }
+    } else {
+      g_duty -= DUTY_STEP;
+      if (g_duty <= 0) {
+        g_duty = 0;
+        // End of one full ramp cycle: stop motor and keep logging to verify speed->0
+        Drive::setPWM(0,true);
+        Serial.println("=== RAMP DONE. Motor STOP. Observe speed decay to 0 ===");
+        delay(TEST_IDLE_MS);
+
+        // Restart ramp
+        g_dir = +1;
+      }
+    }
+
+    // Apply duty (forward only in this test)
+    Drive::setPWM(g_duty,true);
+
+    Serial.printf("=== STEP %lu: set duty=%d ===\n", (unsigned long)g_step_count, (int)g_duty);
+
+    
+  }
+}

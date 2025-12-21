@@ -9,7 +9,7 @@ bool Network::begin()
 {
     Serial.println("Starting Bluetooth SPP...");
 
-    const char* deviceName = "Behind the scream122";
+    const char* deviceName = "Behind the scream";
 
     if (!bt.begin(deviceName))
     {

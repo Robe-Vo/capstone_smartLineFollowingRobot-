@@ -1,140 +1,158 @@
-#pragma once
-#include <stdint.h>
+#include "protocol.hpp"
+#include <string.h>
 
 namespace Protocol {
 
-  // ===================== CMD LIST (ESP32) =====================
-  enum class Cmd : uint8_t {
-    CMD_GLOBAL_OPERATION       = 0xFF,
-    CMD_GLOBAL_IDLE            = 0xFE,
-    CMD_GLOBAL_PING_MODE       = 0xFD,
-    CMD_GLOBAL_EMRGENCY_STOP   = 0xF0,
-
-    // OPERATION
-    CMD_OP_PWM_FWD = 0xEF,
-    CMD_OP_PWM_BWD = 0xEE,
-    CMD_OP_SPD_FWD = 0xED,
-    CMD_OP_SPD_BWD = 0xEC,
-    CMD_OP_BRAKE   = 0xEB,
-
-    // IDLE sensors
-    CMD_IDLE_SENSOR_LINE_READ  = 0xDF,
-    CMD_IDLE_SENSOR_ULTRA_READ = 0xDE,
-    CMD_IDLE_SENSOR_ULTRA_KICK = 0xDD,
-    CMD_IDLE_SENSOR_MPU_READ   = 0xDC,
-    CMD_IDLE_ENCODER_ENABLE    = 0xDB,
-    CMD_IDLE_ENCODER_DISABLE   = 0xDA,
-
-    // IDLE actuators
-    CMD_IDLE_ACTUATOR_MOTOR_ENABLE      = 0xCF,
-    CMD_IDLE_ACTUATOR_MOTOR_DISABLE     = 0xCE,
-    CMD_IDLE_ACTUATOR_MOTOR_PWM_FWD     = 0xCD,
-    CMD_IDLE_ACTUATOR_MOTOR_PWM_BWD     = 0xCC,
-    CMD_IDLE_ACTUATOR_MOTOR_SPD_FWD     = 0xCB,
-    CMD_IDLE_ACTUATOR_MOTOR_SPD_BWD     = 0xCA,
-    CMD_IDLE_ACTUATOR_MOTOR_STOP        = 0xC9,
-
-    CMD_IDLE_ACTUATOR_SERVO_ENABLE       = 0xC8,
-    CMD_IDLE_ACTUATOR_SERVO_DISABLE      = 0xC7,
-    CMD_IDLE_ACTUATOR_SERVO_WRITE        = 0xC6, // payload u16
-    CMD_IDLE_ACTUATOR_SERVO_READ         = 0xC5,
-    CMD_IDLE_ACTUATOR_SERVO_WRITE_CENTER = 0xC4,
-
-    // IDLE set params (payload fixed 30)
-    CMD_IDLE_SET_LINE_PARAMS     = 0xBF,
-    CMD_IDLE_SET_MPU_PARAMS      = 0xBE,
-    CMD_IDLE_SET_ULTRA_PARAMS    = 0xBD,
-    CMD_IDLE_SET_MOTOR_PARAMS    = 0xBC,
-    CMD_IDLE_SET_SERVO_PARAMS    = 0xBB,
-    CMD_IDLE_SET_PID_PARAMS      = 0xBA,
-  };
-
-  // ===================== ACK =====================
-  static constexpr uint8_t ACK_IDLE = 0x20;
-
-  // ===================== GROUP =====================
-  enum class Group : uint8_t { UNKNOWN=0xFF, SYSTEM=0, IDLE=1, OPERATION=2 };
-
-  inline Group groupOf(uint8_t cmd)
-  {
-    // SYSTEM
-    if (cmd == (uint8_t)Cmd::CMD_GLOBAL_OPERATION ||
-        cmd == (uint8_t)Cmd::CMD_GLOBAL_IDLE ||
-        cmd == (uint8_t)Cmd::CMD_GLOBAL_PING_MODE ||
-        cmd == (uint8_t)Cmd::CMD_GLOBAL_EMRGENCY_STOP) {
-      return Group::SYSTEM;
-    }
-
-    // OPERATION
-    if (cmd == (uint8_t)Cmd::CMD_OP_PWM_FWD ||
-        cmd == (uint8_t)Cmd::CMD_OP_PWM_BWD ||
-        cmd == (uint8_t)Cmd::CMD_OP_SPD_FWD ||
-        cmd == (uint8_t)Cmd::CMD_OP_SPD_BWD ||
-        cmd == (uint8_t)Cmd::CMD_OP_BRAKE) {
-      return Group::OPERATION;
-    }
-
-    // Known IDLE (by explicit list)
-    switch ((Cmd)cmd) {
-      case Cmd::CMD_IDLE_SENSOR_LINE_READ:
-      case Cmd::CMD_IDLE_SENSOR_ULTRA_READ:
-      case Cmd::CMD_IDLE_SENSOR_ULTRA_KICK:
-      case Cmd::CMD_IDLE_SENSOR_MPU_READ:
-      case Cmd::CMD_IDLE_ENCODER_ENABLE:
-      case Cmd::CMD_IDLE_ENCODER_DISABLE:
-      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_ENABLE:
-      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_DISABLE:
-      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_PWM_FWD:
-      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_PWM_BWD:
-      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_SPD_FWD:
-      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_SPD_BWD:
-      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_STOP:
-      case Cmd::CMD_IDLE_ACTUATOR_SERVO_ENABLE:
-      case Cmd::CMD_IDLE_ACTUATOR_SERVO_DISABLE:
-      case Cmd::CMD_IDLE_ACTUATOR_SERVO_WRITE:
-      case Cmd::CMD_IDLE_ACTUATOR_SERVO_READ:
-      case Cmd::CMD_IDLE_ACTUATOR_SERVO_WRITE_CENTER:
-      case Cmd::CMD_IDLE_SET_LINE_PARAMS:
-      case Cmd::CMD_IDLE_SET_MPU_PARAMS:
-      case Cmd::CMD_IDLE_SET_ULTRA_PARAMS:
-      case Cmd::CMD_IDLE_SET_MOTOR_PARAMS:
-      case Cmd::CMD_IDLE_SET_SERVO_PARAMS:
-      case Cmd::CMD_IDLE_SET_PID_PARAMS:
-        return Group::IDLE;
-      default:
-        return Group::UNKNOWN;
-    }
+Group scan(Cmd cmd)
+{
+  if (cmd == Cmd::CMD_GLOBAL_OPERATION ||
+      cmd == Cmd::CMD_GLOBAL_IDLE ||
+      cmd == Cmd::CMD_GLOBAL_PING_MODE ||
+      cmd == Cmd::CMD_GLOBAL_EMRGENCY_STOP) {
+    return Group::SYSTEM;
   }
 
-  // ===================== PAYLOAD LENGTH =====================
-  // return: 0, 2, or 30
-  inline uint8_t payloadLen(uint8_t cmd)
-  {
-    switch ((Cmd)cmd) {
-      // u16 payload (LE)
-      case Cmd::CMD_OP_PWM_FWD:
-      case Cmd::CMD_OP_PWM_BWD:
-      case Cmd::CMD_OP_SPD_FWD:
-      case Cmd::CMD_OP_SPD_BWD:
-      case Cmd::CMD_IDLE_ACTUATOR_SERVO_WRITE:
-      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_PWM_FWD:
-      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_PWM_BWD:
-      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_SPD_FWD:
-      case Cmd::CMD_IDLE_ACTUATOR_MOTOR_SPD_BWD:
-        return 2;
-
-      // 30-byte params
-      case Cmd::CMD_IDLE_SET_LINE_PARAMS:
-      case Cmd::CMD_IDLE_SET_MPU_PARAMS:
-      case Cmd::CMD_IDLE_SET_ULTRA_PARAMS:
-      case Cmd::CMD_IDLE_SET_MOTOR_PARAMS:
-      case Cmd::CMD_IDLE_SET_SERVO_PARAMS:
-      case Cmd::CMD_IDLE_SET_PID_PARAMS:
-        return 30;
-
-      default:
-        return 0;
-    }
+  if (cmd == Cmd::CMD_OP_PWM_FWD ||
+      cmd == Cmd::CMD_OP_PWM_BWD ||
+      cmd == Cmd::CMD_OP_SPD_FWD ||
+      cmd == Cmd::CMD_OP_SPD_BWD ||
+      cmd == Cmd::CMD_OP_BRAKE   ||
+      cmd == Cmd::CMD_OP_LEGACY_CTRL_5B) {
+    return Group::OPERATION;
   }
+
+  switch (cmd) {
+    case Cmd::CMD_IDLE_SENSOR_LINE_READ:
+    case Cmd::CMD_IDLE_SENSOR_ULTRA_READ:
+    case Cmd::CMD_IDLE_SENSOR_ULTRA_KICK:
+    case Cmd::CMD_IDLE_SENSOR_MPU_READ:
+    case Cmd::CMD_IDLE_ENCODER_ENABLE:
+    case Cmd::CMD_IDLE_ENCODER_DISABLE:
+    case Cmd::CMD_IDLE_ACTUATOR_MOTOR_ENABLE:
+    case Cmd::CMD_IDLE_ACTUATOR_MOTOR_DISABLE:
+    case Cmd::CMD_IDLE_ACTUATOR_MOTOR_PWM_FWD:
+    case Cmd::CMD_IDLE_ACTUATOR_MOTOR_PWM_BWD:
+    case Cmd::CMD_IDLE_ACTUATOR_MOTOR_SPD_FWD:
+    case Cmd::CMD_IDLE_ACTUATOR_MOTOR_SPD_BWD:
+    case Cmd::CMD_IDLE_ACTUATOR_MOTOR_STOP:
+    case Cmd::CMD_IDLE_ACTUATOR_SERVO_ENABLE:
+    case Cmd::CMD_IDLE_ACTUATOR_SERVO_DISABLE:
+    case Cmd::CMD_IDLE_ACTUATOR_SERVO_WRITE:
+    case Cmd::CMD_IDLE_ACTUATOR_SERVO_READ:
+    case Cmd::CMD_IDLE_ACTUATOR_SERVO_WRITE_CENTER:
+    case Cmd::CMD_IDLE_SET_LINE_PARAMS:
+    case Cmd::CMD_IDLE_SET_MPU_PARAMS:
+    case Cmd::CMD_IDLE_SET_ULTRA_PARAMS:
+    case Cmd::CMD_IDLE_SET_MOTOR_PARAMS:
+    case Cmd::CMD_IDLE_SET_SERVO_PARAMS:
+    case Cmd::CMD_IDLE_SET_PID_PARAMS:
+      return Group::IDLE;
+    default:
+      return Group::UNKNOWN;
+  }
+}
+
+Payload payloadOf(Cmd cmd)
+{
+  switch (cmd) {
+    case Cmd::CMD_OP_PWM_FWD:
+    case Cmd::CMD_OP_PWM_BWD:
+    case Cmd::CMD_IDLE_ACTUATOR_SERVO_WRITE:
+    case Cmd::CMD_IDLE_ACTUATOR_MOTOR_PWM_FWD:
+    case Cmd::CMD_IDLE_ACTUATOR_MOTOR_PWM_BWD:
+    case Cmd::CMD_IDLE_ACTUATOR_MOTOR_SPD_FWD:
+    case Cmd::CMD_IDLE_ACTUATOR_MOTOR_SPD_BWD:
+      return Payload::U16_LE;
+
+    case Cmd::CMD_OP_SPD_FWD:
+    case Cmd::CMD_OP_SPD_BWD:
+        return Payload::F32_LE;
+
+    case Cmd::CMD_IDLE_SET_LINE_PARAMS:
+    case Cmd::CMD_IDLE_SET_MPU_PARAMS:
+    case Cmd::CMD_IDLE_SET_ULTRA_PARAMS:
+    case Cmd::CMD_IDLE_SET_MOTOR_PARAMS:
+    case Cmd::CMD_IDLE_SET_SERVO_PARAMS:
+    case Cmd::CMD_IDLE_SET_PID_PARAMS:
+      return Payload::BYTES30;
+
+    case Cmd::CMD_OP_LEGACY_CTRL_5B:
+      return Payload::OP5B;
+
+    default:
+      return Payload::NONE;
+  }
+}
+
+uint8_t payloadLen(Payload p)
+{
+    switch (p) {
+      case Payload::NONE:    return 0;
+      case Payload::U16_LE:  return 2;
+      case Payload::BYTES30: return 30;
+      case Payload::OP5B:    return 4;
+      case Payload::F32_LE:  return 4;   // float32
+      default:               return 0;
+    }
+}
+
+
+bool tryRead(Network& net, RxFrame& out)
+{
+  uint8_t cmd_u8 = 0;
+  if (!net.getUint8(cmd_u8)) {
+    return false;
+  }
+
+  Cmd     cmd = (Cmd)cmd_u8;
+  Payload pl  = payloadOf(cmd);
+
+  out.cmd     = cmd;
+  out.group   = scan(cmd);
+  out.payload = pl;
+  out.u16     = 0;
+  out.speed_u16 = 0;
+  out.angle_u16 = 0;
+  memset(out.bytes30, 0, sizeof(out.bytes30));
+
+  switch (pl) {
+    case Payload::NONE:
+      break;
+
+    case Payload::U16_LE: {
+      uint8_t buf[2];
+      if (!net.getArrayUint8(buf, 2)) return false;
+      out.u16 = get_u16_le(buf);
+      break;
+    }
+
+    case Payload::BYTES30: {
+      if (!net.getArrayUint8(out.bytes30, 30)) return false;
+      break;
+    }
+
+    case Payload::OP5B: {
+      uint8_t buf[4];
+      if (!net.getArrayUint8(buf, 4)) return false;
+      out.speed_u16 = get_u16_le(&buf[0]);
+      out.angle_u16 = get_u16_le(&buf[2]);
+      break;
+    }
+
+    case Payload::F32_LE: {
+      uint8_t buf[4];
+      if (!net.getArrayUint8(buf, 4)) return false;
+      float v;
+      memcpy(&v, buf, 4);   // ESP32 little-endian nên copy thẳng
+      out.f32 = v;
+      break;
+    }
+
+    default:
+      break;
+  }
+
+  return true;
+}
 
 } // namespace Protocol

@@ -10,7 +10,7 @@ function roads = cfg_roads(robot)
     %  [1] L1 (LINE)
     %% =====================================================================
     i = 1;
-    roads(i).id   = "L1";
+    roads(i).id   = "1";
     roads(i).type = "LINE";
 
     roads(i).geom.start_xy_mm  = [   0.00    0.00];
@@ -69,7 +69,7 @@ function roads = cfg_roads(robot)
     %  [2] A2 (ARC, R=500)
     %% =====================================================================
     i = 2;
-    roads(i).id   = "A2";
+    roads(i).id   = "2";
     roads(i).type = "ARC";
 
     roads(i).geom.start_xy_mm  = [-2500.00     0.00];
@@ -99,7 +99,7 @@ function roads = cfg_roads(robot)
     %  [3] L3 (LINE)
     %% =====================================================================
     i = 3;
-    roads(i).id   = "L3";
+    roads(i).id   = "3";
     roads(i).type = "LINE";
 
     roads(i).geom.start_xy_mm  = [-2500.00 1000.00];
@@ -162,7 +162,7 @@ function roads = cfg_roads(robot)
     %  [5] A5 (ARC, R=800)
     %% =====================================================================
     i = 5;
-    roads(i).id   = "A5";
+    roads(i).id   = "5";
     roads(i).type = "ARC";
 
     roads(i).geom.start_xy_mm  = [-1765.69 1234.31];

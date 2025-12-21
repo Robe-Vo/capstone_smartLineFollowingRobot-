@@ -246,6 +246,25 @@ classdef Network < handle
         function disconnect(obj)
             obj.conn = [];
         end
+
+        function opSendSpeedFwd(obj, v_hz)
+            % v_hz: wheel frequency [Hz], dương
+            p = capstone.io.Protocol.constants();
+            b = typecast(single(v_hz), 'uint8');  % float32 -> 4 byte LE
+            obj.sendBytes(uint8([p.CMD_OP_SPD_FWD; b(:)]));
+        end
+
+        function opSendSpeedBwd(obj, v_hz)
+            % v_hz: wheel frequency [Hz], dương
+            p = capstone.io.Protocol.constants();
+            b = typecast(single(v_hz), 'uint8');  % float32 -> 4 byte LE
+            obj.sendBytes(uint8([p.CMD_OP_SPD_BWD; b(:)]));
+        end
+    
+        function opSendBrake(obj)
+            p = capstone.io.Protocol.constants();
+            obj.sendByte(p.CMD_OP_BRAKE);
+        end
     end
 end
 
